@@ -25,8 +25,8 @@ DROP TABLE IF EXISTS `mod_auctionator_itemclass_config`;
 CREATE TABLE `mod_auctionator_itemclass_config` (
   `class` int NOT NULL COMMENT 'item class',
   `subclass` int NOT NULL COMMENT 'item subclass',
-  `bonding` int NOT NULL COMMENT 'bonding level that is the minimum for this class. 2 means greens (for gear), 1 means whites (for bags).',
-  `max_count` int NOT NULL DEFAULT '1' COMMENT 'The maximum number of unique versions of these items to add to the house. Low numbers keep items like weapons from having lots of dups. High nubmers are useful for crafting mats.',
+  `bonding` int NOT NULL COMMENT 'Minimum item_template.bonding threshold for this class/subclass. Values are compared against the item binding flag, not the item quality color (green/white). 0 allows unbound items; higher values require a stronger binding filter.',
+  `max_count` int NOT NULL DEFAULT '1' COMMENT 'The maximum number of unique versions of these items to add to the house. Low numbers keep items like weapons from having lots of duplicates. Higher values are useful for crafting mats.',
   `stack_count` int NOT NULL DEFAULT '1',
   PRIMARY KEY (`class`,`subclass`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;

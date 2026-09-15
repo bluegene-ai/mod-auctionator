@@ -9,14 +9,15 @@ struct AuctionatorHouseConfig
     public:
         uint32 enabled = 0;
         uint32 maxAuctions = 100;
+        uint32 cycleMinutes = 1;
 };
 
 struct AuctionatorBidderConfig
 {
     public:
-        uint32 enabled;
-        uint32 cycleMinutes;
-        uint32 maxPerCycle;
+        uint32 enabled = 0;
+        uint32 cycleMinutes = 30;
+        uint32 maxPerCycle = 1;
 };
 
 struct AuctionatorPriceMultiplierConfig

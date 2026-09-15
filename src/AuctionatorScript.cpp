@@ -13,8 +13,9 @@ public:
 
     void OnStartup() override
     {
+        Auctionator* auctionator = Auctionator::getInstance();
         LOG_INFO("server.loading", "[Auctionator]: Auctionator initializing...");
-        if (gAuctionator->config->isEnabled) {
+        if (auctionator->config->isEnabled) {
             LOG_INFO("server.loading", "[Auctionator]: Auctionator enabled.");
         } else {
             LOG_INFO("server.loading", "[Auctionator]: Auctionator disabled.");
@@ -38,7 +39,12 @@ class AuctionatorHouseScript : public AuctionHouseScript
                 bool& /*sendMail*/
             ) override
         {
-            if (owner && owner->GetGUID().GetCounter() == gAuctionator->config->characterGuid)
+            Auctionator* auctionator = Auctionator::getInstance();
+            if (!auctionator || !auctionator->config) {
+                return;
+            }
+
+            if (owner && owner->GetGUID().GetCounter() == auctionator->config->characterGuid)
             {
                 sendNotification = false;
                 updateAchievementCriteria = false;
@@ -54,7 +60,12 @@ class AuctionatorHouseScript : public AuctionHouseScript
                 bool& /*sendMail*/
             ) override
         {
-            if (owner && owner->GetGUID().GetCounter() == gAuctionator->config->characterGuid)
+            Auctionator* auctionator = Auctionator::getInstance();
+            if (!auctionator || !auctionator->config) {
+                return;
+            }
+
+            if (owner && owner->GetGUID().GetCounter() == auctionator->config->characterGuid)
                 sendNotification = false;
         }
 
@@ -69,29 +80,24 @@ class AuctionatorHouseScript : public AuctionHouseScript
                 bool& /*sendMail*/
             ) override
         {
-            if (oldBidder && !newBidder)
+            Auctionator* auctionator = Auctionator::getInstance();
+            if (!auctionator || !auctionator->config || !auction || !oldBidder || newBidder) {
+                return;
+            }
+
+            if (oldBidder->GetSession())
                 oldBidder->GetSession()->SendAuctionBidderNotification(
                     (uint32)auction->GetHouseId(),
                     auction->Id,
-                    ObjectGuid::Create<HighGuid::Player>(gAuctionator->config->characterGuid),
+                    ObjectGuid::Create<HighGuid::Player>(auctionator->config->characterGuid),
                     newPrice,
                     auction->GetAuctionOutBid(),
                     auction->item_template);
         }
 
-        // void OnAuctionAdd(AuctionHouseObject* /*ah*/, AuctionEntry* auction) override
-        // {
-        //     auctionbot->IncrementItemCounts(auction);
-        // }
-
-        // void OnAuctionRemove(AuctionHouseObject* /*ah*/, AuctionEntry* auction) override
-        // {
-        //     auctionbot->DecrementItemCounts(auction, auction->item_template);
-        // }
-
         void OnBeforeAuctionHouseMgrUpdate() override
         {
-            gAuctionator->Update();
+            Auctionator::getInstance()->Update();
         }
 
 };
@@ -104,11 +110,19 @@ public:
 
     void OnBeforeMailDraftSendMailTo(MailDraft* /*mailDraft*/, MailReceiver const& receiver, MailSender const& sender, MailCheckMask& /*checked*/, uint32& /*deliver_delay*/, uint32& /*custom_expiration*/, bool& deleteMailItemsFromDB, bool& sendMail) override
     {
-        if (receiver.GetPlayerGUIDLow() == gAuctionator->config->characterGuid)
-        {
-            if (sender.GetMailMessageType() == MAIL_AUCTION)        // auction mail with items
-                deleteMailItemsFromDB = true;
+        Auctionator* auctionator = Auctionator::getInstance();
+        if (!auctionator || !auctionator->config) {
+            return;
+        }
+
+        if (receiver.GetPlayerGUIDLow() != auctionator->config->characterGuid) {
+            return;
+        }
+
+        if (sender.GetMailMessageType() == MAIL_AUCTION) {
+            deleteMailItemsFromDB = true;
             sendMail = false;
+            return;
         }
     }
 };

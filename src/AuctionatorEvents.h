@@ -15,12 +15,18 @@ using FunctionType = void (*)();
 class AuctionatorEvents : public AuctionatorBase
 {
     private:
+        using EventHandler = void (AuctionatorEvents::*)();
+
         ObjectGuid auctionatorGuid;
         EventMap events;
-        std::unordered_map<std::string, std::function<void()>> eventFunctions;
         std::unordered_map<uint32, std::string> eventToFunction;
+        std::unordered_map<uint32, EventHandler> eventHandlers;
         AuctionatorConfig* config;
         AuctionatorHouses* houses;
+
+        void DispatchEvent(uint32 currentEvent);
+        void RescheduleEvent(uint32 currentEvent);
+        std::chrono::minutes GetEventInterval(uint32 currentEvent) const;
 
     public:
         AuctionatorEvents() {};

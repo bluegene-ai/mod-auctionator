@@ -19,12 +19,18 @@
 Auctionator::Auctionator()
 {
     SetLogPrefix("[Auctionator] ");
+    config = nullptr;
+    houses = nullptr;
+    initialized = false;
     InitializeConfig(sConfigMgr);
     Initialize();
 
     logInfo("Event init");
 
-    AuctionatorHouses* houses = new AuctionatorHouses();
+    if (!houses) {
+        houses = new AuctionatorHouses();
+    }
+
     houses->HordeAh = HordeAh;
     houses->AllianceAh = AllianceAh;
     houses->NeutralAh = NeutralAh;
@@ -33,13 +39,79 @@ Auctionator::Auctionator()
     events = AuctionatorEvents(config);
     events.SetPlayerGuid(buyerGuid);
     events.SetHouses(houses);
+
+    if (!IsReady()) {
+        logError("[Auctionator] initialization incomplete after setup.");
+    }
 };
 
 Auctionator::~Auctionator()
-{}
+{
+    if (session) {
+        delete session;
+        session = nullptr;
+    }
+
+    if (houses) {
+        delete houses;
+        houses = nullptr;
+    }
+
+    if (config) {
+        delete config;
+        config = nullptr;
+    }
+}
 
 void Auctionator::CreateAuction(AuctionatorItem newItem)
 {
+    if (!config || !sAuctionMgr || !sWorld) {
+        logError("Auctionator CreateAuction failed: config/world/auction manager is not ready.");
+        return;
+    }
+
+    if (!session) {
+        logError("Auctionator CreateAuction failed: session is not initialized.");
+        return;
+    }
+
+    if (config->characterGuid == 0) {
+        logError("Auctionator CreateAuction failed: characterGuid is zero; system auction owner is not configured.");
+        return;
+    }
+
+    if (newItem.itemId == 0) {
+        logError("Auctionator CreateAuction failed: itemId is zero.");
+        return;
+    }
+
+    if (newItem.stackSize == 0) {
+        newItem.stackSize = 1;
+    }
+
+    if (newItem.stackSize > 20) {
+        newItem.stackSize = 20;
+    }
+
+    if (newItem.houseId != (uint32)AuctionHouseId::Alliance &&
+        newItem.houseId != (uint32)AuctionHouseId::Horde &&
+        newItem.houseId != (uint32)AuctionHouseId::Neutral) {
+        logError("Auctionator CreateAuction failed: invalid houseId " + std::to_string(newItem.houseId));
+        return;
+    }
+
+    AuctionHouseObject* house = nullptr;
+    AuctionHouseEntry const* entry = nullptr;
+    if (!ValidateHouseState(newItem.houseId, house, entry)) {
+        logError("Auctionator CreateAuction failed: auction house data is not initialized for houseId " + std::to_string(newItem.houseId));
+        return;
+    }
+
+    if (newItem.buyout == 0 && newItem.bid == 0) {
+        logError("Auctionator CreateAuction failed: item " + std::to_string(newItem.itemId) + " has zero buyout and bid prices.");
+        return;
+    }
+
     // will need this when we want to know details of the item for filtering
     // ItemTemplate const* prototype = sObjectMgr->GetItemTemplate(itemId);
 
@@ -52,6 +124,11 @@ void Auctionator::CreateAuction(AuctionatorItem newItem)
     logDebug("Creating Auction for item: " + std::to_string(newItem.itemId));
     // Create the item (and add it to the update queue for the player ")
     Item* item = Item::CreateItem(newItem.itemId, 1, &player);
+    if (!item) {
+        logError("Auctionator CreateAuction failed: unable to create item " + std::to_string(newItem.itemId));
+        ObjectAccessor::RemoveObject(&player);
+        return;
+    }
 
     logTrace("adding item to player queue");
     item->AddToUpdateQueueOf(&player);
@@ -77,19 +154,36 @@ void Auctionator::CreateAuction(AuctionatorItem newItem)
     auctionEntry->houseId = (AuctionHouseId)houseId;
     auctionEntry->item_guid = item->GetGUID();
     auctionEntry->item_template = item->GetEntry();
-    auctionEntry->owner = player.GetGUID();
+    auctionEntry->itemCount = newItem.stackSize;
+    auctionEntry->owner = ObjectGuid::Create<HighGuid::Player>(config->characterGuid);
     auctionEntry->startbid = newItem.bid;
     auctionEntry->buyout = newItem.buyout;
     auctionEntry->bid = 0;
-    auctionEntry->deposit = 100;
-    auctionEntry->expire_time = (time_t) newItem.time + time(NULL);
-    auctionEntry->auctionHouseEntry = GetAuctionHouseEntry(houseId);;
+    auctionEntry->bidder = ObjectGuid::Empty;
+    auctionEntry->deposit = std::max<uint32>(100, newItem.buyout / 10);
+    auctionEntry->expire_time = (time_t)newItem.time + time(nullptr);
+    auctionEntry->auctionHouseEntry = sAuctionMgr->GetAuctionHouseEntryFromHouse((AuctionHouseId)houseId);
+
+    if (!auctionEntry->auctionHouseEntry) {
+        logError("Auctionator CreateAuction failed: unable to resolve auction house entry for houseId " + std::to_string(houseId));
+        delete auctionEntry;
+        ObjectAccessor::RemoveObject(&player);
+        return;
+    }
 
     logTrace("save item to db");
     item->SaveToDB(trans);
 
     logTrace("removed from character queue");
     item->RemoveFromUpdateQueueOf(&player);
+
+    if (item->GetGUID().IsEmpty()) {
+        logError("Auctionator CreateAuction failed: item GUID was invalid after save for item " + std::to_string(newItem.itemId));
+        item->RemoveFromWorld();
+        delete item;
+        ObjectAccessor::RemoveObject(&player);
+        return;
+    }
 
     //
     // Add the Item we are auctioning to the managers item list.
@@ -160,8 +254,52 @@ AuctionHouseObject *Auctionator::GetAuctionHouse(uint32 houseId) {
     }
 }
 
+bool Auctionator::ValidateHouseState(uint32 houseId, AuctionHouseObject*& house, AuctionHouseEntry const*& entry) const
+{
+    switch (houseId)
+    {
+        case (uint32)AuctionHouseId::Alliance:
+            house = AllianceAh;
+            entry = AllianceAhEntry;
+            break;
+        case (uint32)AuctionHouseId::Horde:
+            house = HordeAh;
+            entry = HordeAhEntry;
+            break;
+        case (uint32)AuctionHouseId::Neutral:
+        default:
+            house = NeutralAh;
+            entry = NeutralAhEntry;
+            break;
+    }
+
+    return house != nullptr && entry != nullptr;
+}
+
 void Auctionator::Initialize()
 {
+    if (!config) {
+        logError("Auctionator config is null, cannot initialize.");
+        initialized = false;
+        return;
+    }
+
+    if (!sAuctionMgr || !sWorld) {
+        logError("Auctionator initialization failed: world or auction manager is unavailable.");
+        initialized = false;
+        return;
+    }
+
+    if (config->characterId == 0 || config->characterGuid == 0) {
+        logWarn("Auctionator requires valid CharacterId and CharacterGuid before creating session; seller and bidder features stay disabled.");
+        initialized = false;
+        return;
+    }
+
+    if (!houses) {
+        houses = new AuctionatorHouses();
+    }
+
     std::string accountName = "Auctionator";
 
     HordeAh = sAuctionMgr->GetAuctionsMapByHouseId(AuctionHouseId::Horde);
@@ -173,7 +311,12 @@ void Auctionator::Initialize()
     NeutralAh = sAuctionMgr->GetAuctionsMapByHouseId(AuctionHouseId::Neutral);
     NeutralAhEntry = sAuctionHouseStore.LookupEntry((uint32)AuctionHouseId::Neutral);
 
-    WorldSession _session(
+    if (session) {
+        delete session;
+        session = nullptr;
+    }
+
+    session = new WorldSession(
         config->characterId,
         std::move(accountName),
         0,
@@ -188,14 +331,18 @@ void Auctionator::Initialize()
         0
     );
 
-    session = &_session;
+    initialized = session != nullptr && sAuctionMgr != nullptr && sWorld != nullptr &&
+        HordeAh != nullptr && AllianceAh != nullptr && NeutralAh != nullptr &&
+        HordeAhEntry != nullptr && AllianceAhEntry != nullptr && NeutralAhEntry != nullptr;
 }
 
 void Auctionator::InitializeConfig(ConfigMgr* configMgr)
 {
     logInfo("Initializing Auctionator Config");
 
-    config = new AuctionatorConfig();
+    if (!config) {
+        config = new AuctionatorConfig();
+    }
     config->isEnabled = configMgr->GetOption<bool>("Auctionator.Enabled", false);
     logInfo("config->isEnabled: "
         + std::to_string(config->isEnabled));
@@ -208,6 +355,10 @@ void Auctionator::InitializeConfig(ConfigMgr* configMgr)
         + std::to_string(config->characterGuid)
     );
 
+    if (config->characterId == 0 || config->characterGuid == 0) {
+        logError("Auctionator requires a valid CharacterId and CharacterGuid. Seller and bidder features may be disabled until configured.");
+    }
+
     config->hordeSeller.enabled = configMgr->GetOption<uint32>("Auctionator.HordeSeller.Enabled", 0);
     config->allianceSeller.enabled = configMgr->GetOption<uint32>("Auctionator.AllianceSeller.Enabled", 0);
     config->neutralSeller.enabled = configMgr->GetOption<uint32>("Auctionator.NeutralSeller.Enabled", 0);
@@ -216,13 +367,23 @@ void Auctionator::InitializeConfig(ConfigMgr* configMgr)
     config->allianceSeller.maxAuctions = configMgr->GetOption<uint32>("Auctionator.AllianceSeller.MaxAuctions", 50);
     config->neutralSeller.maxAuctions = configMgr->GetOption<uint32>("Auctionator.NeutralSeller.MaxAuctions", 50);
 
+    config->hordeSeller.cycleMinutes = std::max<uint32>(1, configMgr->GetOption<uint32>("Auctionator.HordeSeller.CycleMinutes", 1));
+    config->allianceSeller.cycleMinutes = std::max<uint32>(1, configMgr->GetOption<uint32>("Auctionator.AllianceSeller.CycleMinutes", 1));
+    config->neutralSeller.cycleMinutes = std::max<uint32>(1, configMgr->GetOption<uint32>("Auctionator.NeutralSeller.CycleMinutes", 1));
+
     // Load our seller configurations
     config->sellerConfig.auctionsPerRun = configMgr->GetOption<uint32>("Auctionator.Seller.AuctionsPerRun", 100);
     config->sellerConfig.defaultPrice = configMgr->GetOption<uint32>("Auctionator.Seller.DefaultPrice", 10000000);
-    config->sellerConfig.queryLimit = 
-        configMgr->GetOption<uint32>("Auctionator.Seller.QueryLimit", config->sellerConfig.auctionsPerRun);
+    config->sellerConfig.queryLimit = std::max<uint32>(
+        1,
+        configMgr->GetOption<uint32>("Auctionator.Seller.QueryLimit", config->sellerConfig.auctionsPerRun)
+    );
     config->sellerConfig.randomizeStackSize = configMgr->GetOption<uint32>("Auctionator.Seller.RandomizeStackSize", 1);
-    config->sellerConfig.bidStartModifier = configMgr->GetOption<float>("Auctionator.Seller.BidStartModifier", 1.0f);
+    config->sellerConfig.bidStartModifier = std::clamp(
+        configMgr->GetOption<float>("Auctionator.Seller.BidStartModifier", 1.0f),
+        0.0f,
+        1.0f
+    );
 
     // Load our bidder configurations
     config->allianceBidder.enabled = configMgr->GetOption<uint32>("Auctionator.AllianceBidder.Enabled", 0);
@@ -241,31 +402,31 @@ void Auctionator::InitializeConfig(ConfigMgr* configMgr)
 
     // load out multipliers for seller prices
     config->sellerMultipliers.poor
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Poor", 1.0f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Poor", 1.0f));
     config->sellerMultipliers.normal
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Normal", 1.0f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Normal", 1.0f));
     config->sellerMultipliers.uncommon
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Uncommon", 1.5f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Uncommon", 1.5f));
     config->sellerMultipliers.rare
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Rare", 2.0f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Rare", 2.0f));
     config->sellerMultipliers.epic
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Epic", 6.0f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Epic", 6.0f));
     config->sellerMultipliers.legendary
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Legendary", 10.0f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Seller.Legendary", 10.0f));
 
     // load out multipliers for bidder prices
     config->bidderMultipliers.poor
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Poor", 1.0f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Poor", 1.0f));
     config->bidderMultipliers.normal
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Normal", 1.0f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Normal", 1.0f));
     config->bidderMultipliers.uncommon
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Uncommon", 1.5f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Uncommon", 1.5f));
     config->bidderMultipliers.rare
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Rare", 2.0f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Rare", 2.0f));
     config->bidderMultipliers.epic
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Epic", 6.0f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Epic", 6.0f));
     config->bidderMultipliers.legendary
-        = configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Legendary", 10.0f);
+        = std::max(0.0f, configMgr->GetOption<float>("Auctionator.Multipliers.Bidder.Legendary", 10.0f));
 
     logInfo("Auctionator config initialized");
 }
@@ -275,81 +436,22 @@ void Auctionator::InitializeConfig(ConfigMgr* configMgr)
 */
 void Auctionator::Update()
 {
-    logInfo("- - - - - - - - - - - - - - - - - - - -");
-
-    logInfo("Neutral count: " + std::to_string(NeutralAh->Getcount()));
-    logInfo("Alliance count: " + std::to_string(AllianceAh->Getcount()));
-    logInfo("Horde count: " + std::to_string(HordeAh->Getcount()));
-
-/*
-    if (config->allianceSeller.enabled) {
-        AuctionatorSeller sellerAlliance =
-            AuctionatorSeller(gAuctionator, static_cast<uint32>(AuctionHouseId::Alliance));
-
-        uint32 auctionCountAlliance = AllianceAh->Getcount();
-
-        if (auctionCountAlliance <= config->allianceSeller.maxAuctions) {
-            logInfo(
-                "Alliance count is good, here we go: "
-                + std::to_string(auctionCountAlliance)
-                + " of " + std::to_string(config->allianceSeller.maxAuctions)
-            );
-
-            sellerAlliance.LetsGetToIt(100, AuctionHouseId::Alliance);
-        } else {
-            logInfo("Alliance count over max: " + std::to_string(auctionCountAlliance));
-        }
-    } else {
-        logInfo("Alliance Seller Disabled");
+    if (!IsReady()) {
+        logWarn("Auctionator update skipped: module is not ready.");
+        return;
     }
 
-    if (config->hordeSeller.enabled) {
-        AuctionatorSeller sellerHorde =
-            AuctionatorSeller(gAuctionator, static_cast<uint32>(AuctionHouseId::Horde));
-
-        uint32 auctionCountHorde = HordeAh->Getcount();
-
-        if (auctionCountHorde <= config->hordeSeller.maxAuctions) {
-            logInfo(
-                "Horde count is good, here we go: "
-                + std::to_string(auctionCountHorde)
-                + " of " + std::to_string(config->hordeSeller.maxAuctions)
-            );
-
-            sellerHorde.LetsGetToIt(100, AuctionHouseId::Horde);
-        } else {
-            logInfo("Horde count over max: " + std::to_string(auctionCountHorde));
-        }
-    } else {
-        logInfo("Horde Seller Disabled");
+    if (!NeutralAh || !AllianceAh || !HordeAh) {
+        logWarn("Auctionator update skipped: one or more auction house maps are null.");
+        return;
     }
 
-    if (config->neutralSeller.enabled) {
-        AuctionatorSeller sellerNeutral =
-            AuctionatorSeller(gAuctionator, static_cast<uint32>(AuctionHouseId::Neutral));
+    logDebug("Neutral count: " + std::to_string(NeutralAh->Getcount()));
+    logDebug("Alliance count: " + std::to_string(AllianceAh->Getcount()));
+    logDebug("Horde count: " + std::to_string(HordeAh->Getcount()));
 
-        uint32 auctionCountNeutral = NeutralAh->Getcount();
-
-        if (auctionCountNeutral <= config->neutralSeller.maxAuctions) {
-            logInfo(
-                "Neutral count is good, here we go: "
-                + std::to_string(auctionCountNeutral)
-                + " of " + std::to_string(config->neutralSeller.maxAuctions)
-            );
-
-            sellerNeutral.LetsGetToIt(100, AuctionHouseId::Neutral);
-        } else {
-            logInfo("Neutral count over max: " + std::to_string(auctionCountNeutral));
-        }
-    } else {
-        logInfo("Neutral Seller Disabled");
-    }
-*/
-
-    logInfo("UpdatingEvents");
+    logDebug("UpdatingEvents");
     events.Update(60000);
-
-    logInfo("^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^");
 }
 
 AuctionHouseObject* Auctionator::GetAuctionMgr(uint32 auctionHouseId)
@@ -385,7 +487,12 @@ void Auctionator::ExpireAllAuctions(uint32 houseId)
     // it won't happen till after the next tick of Auctionator passes
     // because our update happens before the server gets a chance to update.
     //
-    AuctionHouseObject* ah = sAuctionMgr->GetAuctionsMapByHouseId((AuctionHouseId)houseId);
+    AuctionHouseObject* ah = GetAuctionHouse(houseId);
+    if (!ah) {
+        logDebug("Unable to expire auctions for invalid houseId: " + std::to_string(houseId));
+        return;
+    }
+
     for (
         AuctionHouseObject::AuctionEntryMap::iterator itr,
         iter = ah->GetAuctionsBegin();
@@ -394,6 +501,16 @@ void Auctionator::ExpireAllAuctions(uint32 houseId)
     {
         itr = iter++;
         AuctionEntry* auction = (*itr).second;
+        if (!auction) {
+            continue;
+        }
+
+        if (auction->houseId != AuctionHouseId::Alliance &&
+            auction->houseId != AuctionHouseId::Horde &&
+            auction->houseId != AuctionHouseId::Neutral) {
+            continue;
+        }
+
         logTrace("Expiring auction " + std::to_string(auction->Id) +
             " for house " + std::to_string((uint32)auction->houseId));
         auction->expire_time = 0;
@@ -404,7 +521,7 @@ void Auctionator::ExpireAllAuctions(uint32 houseId)
 
 float Auctionator::GetQualityMultiplier(AuctionatorPriceMultiplierConfig config, uint32 quality)
 {
-    switch(quality) {
+    switch (quality) {
         case ITEM_QUALITY_POOR:
             return config.poor;
         case ITEM_QUALITY_NORMAL:
@@ -417,7 +534,11 @@ float Auctionator::GetQualityMultiplier(AuctionatorPriceMultiplierConfig config,
             return config.epic;
         case ITEM_QUALITY_LEGENDARY:
             return config.legendary;
+        case ITEM_QUALITY_ARTIFACT:
+            return config.legendary;
+        case ITEM_QUALITY_HEIRLOOM:
+            return config.legendary;
         default:
-            return 1;
+            return config.normal > 0.0f ? config.normal : 1.0f;
     }
 }

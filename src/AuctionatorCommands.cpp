@@ -1,12 +1,46 @@
 
 #include <iostream>
 #include <string>
+#include <limits>
 #include "ScriptMgr.h"
 #include "Chat.h"
 #include "Auctionator.h"
 #include "AuctionatorConfig.h"
 
 using namespace Acore::ChatCommands;
+
+namespace
+{
+    bool TryParseUInt32(const std::string& value, uint32& result)
+    {
+        try {
+            size_t idx = 0;
+            unsigned long long parsed = std::stoull(value, &idx, 10);
+            if (idx != value.size() || parsed > std::numeric_limits<uint32>::max()) {
+                return false;
+            }
+            result = static_cast<uint32>(parsed);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
+    bool TryParseFloat(const std::string& value, float& result)
+    {
+        try {
+            size_t idx = 0;
+            float parsed = std::stof(value, &idx);
+            if (idx != value.size()) {
+                return false;
+            }
+            result = parsed;
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+}
 
 class AuctionatorCommands : public CommandScript
 {
@@ -16,122 +50,119 @@ class AuctionatorCommands : public CommandScript
         }
 
     private:
-        static bool HandleCommandOptionsNew(ChatHandler* handler, const std::vector<std::string>& args)
+        static std::vector<const char*> BuildCommandArgs(const std::vector<std::string>& commandParams)
         {
-            std::string command;
-            if (!args.empty())
+            std::vector<const char*> commandParamsArray;
+            commandParamsArray.reserve(commandParams.size());
+            for (const std::string& param : commandParams)
             {
-                command = args[0];
+                commandParamsArray.push_back(param.c_str());
             }
-            else
-            {
-                command = "help";
-            }
+            return commandParamsArray;
+        }
 
-            std::vector<std::string> commandParams;
-            for (size_t i = 1; i < args.size(); ++i)
+        static bool DispatchCommand(ChatHandler* handler, Auctionator* auctionator, const std::string& command, const std::vector<std::string>& commandParams)
+        {
+            if (command == "add")
             {
-                commandParams.push_back(args[i]);
-            }
+                auctionator->logInfo("Adding new Item for GM");
+                if (commandParams.size() >= 3)
+                {
+                    uint32 auctionHouseId = 0;
+                    uint32 itemId = 0;
+                    uint32 price = 0;
 
-            if (command.empty())
-            {
+                    if (!TryParseUInt32(commandParams[0], auctionHouseId) ||
+                        !TryParseUInt32(commandParams[1], itemId) ||
+                        !TryParseUInt32(commandParams[2], price))
+                    {
+                        handler->SendSysMessage("[Auctionator] add: Invalid numeric arguments.");
+                        return true;
+                    }
+
+                    AddItemForBuyout(auctionHouseId, itemId, price, auctionator);
+                    return true;
+                }
+
+                handler->SendSysMessage("[Auctionator] add: Expected <houseid> <itemid> <price>");
                 return true;
             }
 
-            gAuctionator->logDebug("Executing command: " + command);
+            if (command == "auctionspercycle")
+            {
+                auto commandParamsArray = BuildCommandArgs(commandParams);
+                return CommandAuctionsPerCycle(commandParamsArray.data(), handler, auctionator);
+            }
 
-            if (command == "add")
+            if (command == "bidonown")
             {
-                gAuctionator->logInfo("Adding new Item for GM");
-                if (commandParams.size() >= 3)
-                {
-                    uint32 auctionHouseId = std::stoi(commandParams[0]);
-                    uint32 itemId = std::stoi(commandParams[1]);
-                    uint32 price = std::stoi(commandParams[2]);
-                    AddItemForBuyout(auctionHouseId, itemId, price, gAuctionator);
-                }
-                else
-                {
-                    // Handle invalid command arguments
-                }
+                auto commandParamsArray = BuildCommandArgs(commandParams);
+                return CommandBidOnOwn(commandParamsArray.data(), handler, auctionator);
             }
-            else if (command == "auctionspercycle")
 
+            if (command == "bidspercycle")
             {
-                std::vector<const char*> commandParamsArray;
-                for (const std::string& param : commandParams)
-                {
-                    commandParamsArray.push_back(param.c_str());
-                }
-                CommandAuctionsPerCycle(commandParamsArray.data(), handler, gAuctionator);
+                auto commandParamsArray = BuildCommandArgs(commandParams);
+                return CommandBidsPerCycle(commandParamsArray.data(), handler, auctionator);
             }
-            else if (command == "bidonown")
 
+            if (command == "disable")
             {
-                std::vector<const char*> commandParamsArray;
-                for (const std::string& param : commandParams)
-                {
-                    commandParamsArray.push_back(param.c_str());
-                }
-                CommandBidOnOwn(commandParamsArray.data(), handler, gAuctionator);
+                auto commandParamsArray = BuildCommandArgs(commandParams);
+                return CommandDisableSeller(commandParamsArray.data(), handler, auctionator);
             }
-            else if (command == "bidspercycle")
+
+            if (command == "enable")
             {
-                std::vector<const char*> commandParamsArray;
-                for (const std::string& param : commandParams)
-                {
-                    commandParamsArray.push_back(param.c_str());
-                }
-                CommandBidsPerCycle(commandParamsArray.data(), handler, gAuctionator);
+                auto commandParamsArray = BuildCommandArgs(commandParams);
+                return CommandEnableSeller(commandParamsArray.data(), handler, auctionator);
             }
-            else if (command == "disable")
+
+            if (command == "expireall")
             {
-                std::vector<const char*> commandParamsArray;
-                for (const std::string& param : commandParams)
-                {
-                    commandParamsArray.push_back(param.c_str());
-                }
-                CommandDisableSeller(commandParamsArray.data(), handler, gAuctionator);
+                auto commandParamsArray = BuildCommandArgs(commandParams);
+                return CommandExpireAll(commandParamsArray.data(), handler, auctionator);
             }
-            else if (command == "enable")
+
+            if (command == "multiplier")
             {
-                std::vector<const char*> commandParamsArray;
-                for (const std::string& param : commandParams)
-                {
-                    commandParamsArray.push_back(param.c_str());
-                }
-                CommandEnableSeller(commandParamsArray.data(), handler, gAuctionator);
+                auto commandParamsArray = BuildCommandArgs(commandParams);
+                return CommandSetMultiplier(commandParamsArray.data(), handler, auctionator);
             }
-            else if (command == "expireall")
+
+            if (command == "status")
             {
-                std::vector<const char*> commandParamsArray;
-                for (const std::string& param : commandParams)
-                {
-                    commandParamsArray.push_back(param.c_str());
-                }
-                CommandExpireAll(commandParamsArray.data(), handler, gAuctionator);
+                ShowStatus(handler, auctionator);
+                return true;
             }
-            else if (command == "multiplier")
-            {
-                std::vector<const char*> commandParamsArray;
-                for (const std::string& param : commandParams)
-                {
-                    commandParamsArray.push_back(param.c_str());
-                }
-                CommandSetMultiplier(commandParamsArray.data(), handler, gAuctionator);
-            }
-            else if (command == "status")
-            {
-                ShowStatus(handler, gAuctionator);
-            }
-            else if (command == "help")
+
+            if (command == "help")
             {
                 ShowHelp(handler);
                 return true;
             }
 
             return true;
+        }
+
+        static bool HandleCommandOptionsNew(ChatHandler* handler, const std::vector<std::string>& args)
+        {
+            std::string command = args.empty() ? "help" : args[0];
+            if (command.empty())
+            {
+                return true;
+            }
+
+            std::vector<std::string> commandParams;
+            commandParams.reserve(args.size() - 1);
+            for (size_t i = 1; i < args.size(); ++i)
+            {
+                commandParams.push_back(args[i]);
+            }
+
+            Auctionator* auctionator = Auctionator::getInstance();
+            auctionator->logDebug("Executing command: " + command);
+            return DispatchCommand(handler, auctionator, command, commandParams);
         }
 
         ChatCommandTable GetCommands() const override
@@ -144,68 +175,14 @@ class AuctionatorCommands : public CommandScript
             return commandTableBase;
         }
 
-        static bool HandleCommandOptions(ChatHandler* handler, const char* args)
-        {
-            const char* command = strtok((char*)args, " ");
-
-            if(!command)
-            {
-                command = "help";
-            }
-
-            const char* param1 = strtok(NULL, " ");
-            const char* param2 = strtok(NULL, " ");
-            const char* param3 = strtok(NULL, " ");
-            const char* param4 = strtok(NULL, " ");
-
-            // Create an array of const char* items
-            const char* commandParams[] = { param1, param2, param3, param4 };
-
-            if(strlen(command) == 0) {
-                return true;
-            }
-
-            std::string commandString(command);
-
-            gAuctionator->logDebug("Executing command: " + commandString);
-
-            if (commandString.compare("add") == 0) {
-                gAuctionator->logInfo("Adding new Item for GM");
-                uint32 auctionHouseId = std::stoi(param1);
-                uint32 itemId = std::stoi(param2);
-                uint32 price = std::stoi(param3);
-                AddItemForBuyout(auctionHouseId, itemId, price, gAuctionator);
-            } else if (commandString == "auctionspercycle") {
-                CommandAuctionsPerCycle(commandParams, handler, gAuctionator);
-            } else if (commandString == "bidonown") {
-                CommandBidOnOwn(commandParams, handler, gAuctionator);
-            } else if (commandString == "bidspercycle") {
-                CommandBidsPerCycle(commandParams, handler, gAuctionator);
-            } else if (commandString == "disable") {
-                CommandDisableSeller(commandParams, handler, gAuctionator);
-            } else if (commandString == "enable") {
-                CommandEnableSeller(commandParams, handler, gAuctionator);
-            } else if (commandString == "expireall") {
-                CommandExpireAll(commandParams, handler, gAuctionator);
-            } else if (commandString == "multiplier") {
-                CommandSetMultiplier(commandParams, handler, gAuctionator);
-            } else if (commandString == "status") {
-                ShowStatus(handler, gAuctionator);
-            } else if (commandString == "help") {
-                ShowHelp(handler);
-                return true;
-            }
-
-
-            return true;
-        }
-
         static void AddItemForBuyout(uint32 auctionHouseId, uint32 itemId, uint32 price, Auctionator* auctionator)
         {
             AuctionatorItem newItem;
             newItem.houseId = auctionHouseId;
             newItem.itemId = itemId;
             newItem.buyout = price;
+            newItem.bid = 0;
+            newItem.stackSize = 1;
 
             auctionator->CreateAuction(newItem);
         }
@@ -293,7 +270,11 @@ help
                 auctionator->logInfo("expireall: No Auction House Specified!");
                 return true;
             }
-            uint32 houseId = std::stoi(params[0]);
+            uint32 houseId = 0;
+            if (!TryParseUInt32(params[0], houseId)) {
+                handler->SendSysMessage("[Auctionator] expireall: House id must be a number.");
+                return true;
+            }
 
             handler->SendSysMessage("[Auctionator] Expiring all Auctions for house: "
                 + std::to_string(houseId));
@@ -407,26 +388,33 @@ help
             if (!params[0]) {
                 handler->SendSysMessage("[Auctionator] multiplier: No type specified! [seller, bidder]");
                 auctionator->logInfo("multiplier: No type specified");
+                return true;
             }
 
             if (!params[1]) {
                 handler->SendSysMessage("[Auctionator] multiplier: No quality specified! [poor, normal, uncommon, rare, epic, legendary]");
                 auctionator->logInfo("multiplier: No quality specified");
+                return true;
             }
 
             if (!params[2]) {
                 handler->SendSysMessage("[Auctionator] multiplier: No multiplier specified!");
                 auctionator->logInfo("multiplier: No multiplier specified Specified!");
-            }
-
-            if (!params[0] || !params[1] || !params[2]) {
-                handler->SendSysMessage("[Auctionator] multiplier: Invalid parameters!");
                 return true;
             }
 
             std::string type(params[0]);
             std::string quality(params[1]);
-            uint32 newMultiplier = std::stoi(params[2]);
+            float newMultiplier = 0.0f;
+            if (!TryParseFloat(params[2], newMultiplier)) {
+                handler->SendSysMessage("[Auctionator] multiplier: Number must be a valid float.");
+                return true;
+            }
+
+            if (!std::isfinite(newMultiplier) || newMultiplier < 0.0f) {
+                handler->SendSysMessage("[Auctionator] multiplier: Value must be a finite non-negative float.");
+                return true;
+            }
 
             AuctionatorPriceMultiplierConfig* multipliers;
 
@@ -479,7 +467,11 @@ help
                 return true;
             }
 
-            uint32 bidOnOwn = std::stoi(params[0]);
+            uint32 bidOnOwn = 0;
+            if (!TryParseUInt32(params[0], bidOnOwn)) {
+                handler->SendSysMessage("[Auctionator] bidonown: Need to specify 1 (on) or 0 (off).");
+                return true;
+            }
 
             if (bidOnOwn == 1) {
                 auctionator->config->bidOnOwn = 1;
@@ -499,7 +491,11 @@ help
                 return true;
             }
 
-            uint32 bidsPerCycle = std::stoi(params[0]);
+            uint32 bidsPerCycle = 0;
+            if (!TryParseUInt32(params[0], bidsPerCycle)) {
+                handler->SendSysMessage("[Auctionator] bidspercycle: Need to specify a number.");
+                return true;
+            }
 
             auctionator->config->allianceBidder.maxPerCycle = bidsPerCycle;
             auctionator->config->hordeBidder.maxPerCycle = bidsPerCycle;
@@ -517,7 +513,11 @@ help
                 return true;
             }
 
-            uint32 auctionsPerCycle = std::stoi(params[0]);
+            uint32 auctionsPerCycle = 0;
+            if (!TryParseUInt32(params[0], auctionsPerCycle)) {
+                handler->SendSysMessage("[Auctionator] auctionspercycle: Need to specify a number.");
+                return true;
+            }
             auctionator->config->sellerConfig.auctionsPerRun = auctionsPerCycle;
             handler->SendSysMessage("[Auctionator] auctionspercycle: Set auctions per cycle to "
                 + std::to_string(auctionsPerCycle));

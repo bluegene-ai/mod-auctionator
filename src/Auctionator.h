@@ -36,6 +36,7 @@ class Auctionator : public AuctionatorBase
 {
     private:
         Auctionator();
+        bool initialized = false;
         AuctionHouseObject* HordeAh;
         AuctionHouseObject* AllianceAh;
         AuctionHouseObject* NeutralAh;
@@ -43,6 +44,7 @@ class Auctionator : public AuctionatorBase
         AuctionHouseEntry const* AllianceAhEntry;
         AuctionHouseEntry const* NeutralAhEntry;
         WorldSession *session;
+        AuctionatorHouses* houses;
         AuctionatorEvents events;
 
     public:
@@ -51,10 +53,15 @@ class Auctionator : public AuctionatorBase
         void ExpireAllAuctions(uint32 houseId);
         AuctionHouseEntry const *GetAuctionHouseEntry(uint32 houseId);
         AuctionHouseObject *GetAuctionHouse(uint32 houseId);
+        bool ValidateHouseState(uint32 houseId, AuctionHouseObject*& house, AuctionHouseEntry const*& entry) const;
         void Initialize();
         void InitializeConfig(ConfigMgr* configMgr);
         AuctionatorConfig *config;
         void Update();
+        bool IsReady() const
+        {
+            return initialized && config && session && sAuctionMgr && sWorld;
+        }
 
         AuctionHouseObject *GetAuctionMgr(uint32 auctionHouseId);
         static float GetQualityMultiplier(AuctionatorPriceMultiplierConfig config, uint32 quality);
@@ -66,11 +73,8 @@ class Auctionator : public AuctionatorBase
         }
 };
 
-// I am doing this because when i started this project (and likely still)
-// i sucked at c++ and just copied what i saw in the rest of tcore/acore.
-// But. Don't do this global singleton bullsh!t. It's really bad and it
-// makes this codebase impossible to do any real unit testing on. 
-// TODO: figure out how to get rid of this really bad sh!t.
+// Legacy compatibility alias kept only for old call sites during migration.
+// New code should use Auctionator::getInstance() explicitly.
 #define gAuctionator Auctionator::getInstance()
 
 #endif

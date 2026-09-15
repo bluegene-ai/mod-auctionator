@@ -10,9 +10,12 @@ AuctionatorBidder::AuctionatorBidder(uint32 auctionHouseIdParam, ObjectGuid buye
     SetLogPrefix("[AuctionatorBidder] ");
     auctionHouseId = auctionHouseIdParam;
     buyerGuid = buyer;
-    ahMgr = sAuctionMgr->GetAuctionsMapByHouseId((AuctionHouseId)auctionHouseId);
     config = auctionatorConfig;
-    bidOnOwn = config->bidOnOwn;
+    bidOnOwn = config ? config->bidOnOwn : 0;
+    ahMgr = sAuctionMgr ? sAuctionMgr->GetAuctionsMapByHouseId((AuctionHouseId)auctionHouseId) : nullptr;
+    if (!config) {
+        logError("AuctionatorBidder constructed without a valid config pointer.");
+    }
 }
 
 AuctionatorBidder::~AuctionatorBidder()
@@ -22,13 +25,21 @@ AuctionatorBidder::~AuctionatorBidder()
 
 void AuctionatorBidder::SpendSomeCash()
 {
+    if (!config || !sAuctionMgr || !ahMgr) {
+        logWarn("AuctionatorBidder::SpendSomeCash skipped: config or auction manager is unavailable.");
+        return;
+    }
+
     uint32 auctionatorPlayerGuid = buyerGuid.GetRawValue();
 
+    uint32 maxQueryCount = std::max<uint32>(GetAuctionsPerCycle() * 10u, 100u);
     std::string query = R"(
         SELECT
             ah.id
         FROM auctionhouse ah
-        WHERE itemowner <> {} AND houseid = {};
+        WHERE itemowner <> {} AND houseid = {}
+        ORDER BY ah.id
+        LIMIT {};
     )";
 
     // for testing we may want to bid on our own auctions.
@@ -39,7 +50,7 @@ void AuctionatorBidder::SpendSomeCash()
         ownerToSkip = 0;
     }
 
-    QueryResult result = CharacterDatabase.Query(query, ownerToSkip, auctionHouseId);
+    QueryResult result = CharacterDatabase.Query(query, ownerToSkip, auctionHouseId, maxQueryCount);
 
     if (!result) {
         logInfo("Can't see player auctions at ["
@@ -60,11 +71,11 @@ void AuctionatorBidder::SpendSomeCash()
     } while(result->NextRow());
 
     // shuffle our vector to try to inject some randomness
-    unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
+    std::mt19937 engine(static_cast<unsigned>(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::shuffle(
         biddableAuctionIds.begin(),
         biddableAuctionIds.end(),
-        std::default_random_engine(seed)
+        engine
     );
 
     logInfo("Found " + std::to_string(biddableAuctionIds.size()) + " biddable auctions");
@@ -78,11 +89,15 @@ void AuctionatorBidder::SpendSomeCash()
         AuctionEntry* auction = GetAuctionForPurchase(biddableAuctionIds);
 
         if (auction == nullptr) {
-            return;
+            break;
         }
 
         // get our item template for this item, we need some of these details for pricing and such.
         ItemTemplate const* itemTemplate = sObjectMgr->GetItemTemplate(auction->item_template);
+        if (!itemTemplate) {
+            logError("Skipping auction " + std::to_string(auction->Id) + ": item template " + std::to_string(auction->item_template) + " is missing.");
+            continue;
+        }
 
         logInfo("Considering auction: "
             + itemTemplate->Name1
@@ -111,7 +126,7 @@ void AuctionatorBidder::SpendSomeCash()
 
 AuctionEntry* AuctionatorBidder::GetAuctionForPurchase(std::vector<uint32>& auctionIds)
 {
-    if (auctionIds.size() == 0) {
+    if (!ahMgr || auctionIds.empty()) {
         return nullptr;
     }
 
@@ -122,6 +137,25 @@ AuctionEntry* AuctionatorBidder::GetAuctionForPurchase(std::vector<uint32>& auct
 
     AuctionEntry* auction = ahMgr->GetAuction(auctionId);
     return auction;
+}
+
+static bool IsValidAuctionLifecycleState(AuctionEntry const* auction)
+{
+    if (!auction) {
+        return false;
+    }
+
+    if (auction->Id == 0 || auction->item_guid.IsEmpty()) {
+        return false;
+    }
+
+    if (auction->houseId != AuctionHouseId::Alliance &&
+        auction->houseId != AuctionHouseId::Horde &&
+        auction->houseId != AuctionHouseId::Neutral) {
+        return false;
+    }
+
+    return true;
 }
 
 bool AuctionatorBidder::BidOnAuction(AuctionEntry* auction, ItemTemplate const* itemTemplate)
@@ -176,7 +210,7 @@ bool AuctionatorBidder::BidOnAuction(AuctionEntry* auction, ItemTemplate const* 
                 auctionhouse
             SET
                 buyguid = {},
-                lastbid = {}.
+                lastbid = {}
             WHERE
                 id = {}
         )",
@@ -196,6 +230,16 @@ bool AuctionatorBidder::BidOnAuction(AuctionEntry* auction, ItemTemplate const* 
 
 bool AuctionatorBidder::BuyoutAuction(AuctionEntry* auction, ItemTemplate const* itemTemplate)
 {
+    if (!auction || !itemTemplate || !sAuctionMgr || !ahMgr) {
+        logError("BuyoutAuction called with invalid auction state.");
+        return false;
+    }
+
+    if (!IsValidAuctionLifecycleState(auction)) {
+        logError("BuyoutAuction skipped: auction does not satisfy the official lifecycle guard.");
+        return false;
+    }
+
     // let's just go ahead and find out what the max we will pay for this item is.
     uint32 buyPrice = CalculateBuyPrice(auction, itemTemplate);
 
@@ -206,37 +250,44 @@ bool AuctionatorBidder::BuyoutAuction(AuctionEntry* auction, ItemTemplate const*
         return false;
     }
 
-    // also based somewhat on what ahbot does, let's go ahead and buy this.
-    auto trans = CharacterDatabase.BeginTransaction();
-    // set our bidder and bid on the auction record.
-    auction->bidder = buyerGuid;
-    auction->bid = auction->buyout;
+    try {
+        auto trans = CharacterDatabase.BeginTransaction();
 
-    // let the seller know we bought their junk.
-    sAuctionMgr->SendAuctionSuccessfulMail(auction, trans);
-    // delete the auction for the database so it doesn't come back on a server reload.
-    auction->DeleteFromDB(trans);
+        // Keep the auction record in a valid state before the official mail/cleanup flow runs.
+        auction->bidder = buyerGuid;
+        auction->bid = auction->buyout;
 
-    logInfo("Purchased auction of "
-        + itemTemplate->Name1 + " ["
-        + std::to_string(auction->Id) + "]"
-        + "x" + std::to_string(auction->itemCount) + " for "
-        + std::to_string(auction->buyout) + " copper."
-    );
+        // Send sale mail before DB delete to keep the official owner/bidder lifecycles consistent.
+        sAuctionMgr->SendAuctionSuccessfulMail(auction, trans);
 
-    // remove the aucton from memory. i don't fully understand why we need to do this
-    // in 2 different places but i am going with it for now.
-    sAuctionMgr->RemoveAItem(auction->item_guid);
-    ahMgr->RemoveAuction(auction);
+        // Remove the persisted auction row once the official sale mail flow has been triggered.
+        auction->DeleteFromDB(trans);
 
-    // commit all these changes, however that works. thanks again ahbot.
-    CharacterDatabase.CommitTransaction(trans);
+        logInfo("Purchased auction of "
+            + itemTemplate->Name1 + " ["
+            + std::to_string(auction->Id) + "]"
+            + "x" + std::to_string(auction->itemCount) + " for "
+            + std::to_string(auction->buyout) + " copper."
+        );
 
-    return true;
+        // Remove the item from the auction manager and the in-memory auctions map while the DB transaction is still open.
+        sAuctionMgr->RemoveAItem(auction->item_guid, true, &trans);
+        ahMgr->RemoveAuction(auction);
+
+        CharacterDatabase.CommitTransaction(trans);
+        return true;
+    } catch (const std::exception& e) {
+        logError("BuyoutAuction transaction failed: " + std::string(e.what()));
+        return false;
+    }
 }
 
 uint32 AuctionatorBidder::GetAuctionsPerCycle()
 {
+    if (!config) {
+        return 0;
+    }
+
     switch(auctionHouseId) {
         case (uint32)AuctionHouseId::Alliance:
             return config->allianceBidder.maxPerCycle;
@@ -254,6 +305,10 @@ uint32 AuctionatorBidder::GetAuctionsPerCycle()
 
 uint32 AuctionatorBidder::CalculateBuyPrice(AuctionEntry* auction, ItemTemplate const* item)
 {
+    if (!config || !auction || !item) {
+        return 0;
+    }
+
     // get our market price for this item.
     uint32 marketPrice = 0;
     std::string query = R"(
@@ -293,5 +348,7 @@ uint32 AuctionatorBidder::CalculateBuyPrice(AuctionEntry* auction, ItemTemplate 
     }
 
     // calculate the max price we will pay for this item stack.
-    return uint32(stackSize * price * qualityMultiplier);
+    const long double multiplier = std::max<long double>(1.0L, static_cast<long double>(qualityMultiplier));
+    const uint64 computed = static_cast<uint64>(std::llround(static_cast<long double>(stackSize) * static_cast<long double>(price) * multiplier));
+    return static_cast<uint32>(std::min<uint64>(std::max<uint64>(1ULL, computed), std::numeric_limits<uint32>::max()));
 }

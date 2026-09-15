@@ -28,12 +28,15 @@ Auctionator.CharacterGuid = 2
 ########################################
 Auctionator.AllianceSeller.Enabled = 0
 Auctionator.AllianceSeller.MaxAuctions = 5000
+Auctionator.AllianceSeller.CycleMinutes = 1
 
 Auctionator.HordeSeller.Enabled = 0
 Auctionator.HordeSeller.MaxAuctions = 5000
+Auctionator.HordeSeller.CycleMinutes = 1
 
 Auctionator.NeutralSeller.Enabled = 0
 Auctionator.NeutralSeller.MaxAuctions = 5000
+Auctionator.NeutralSeller.CycleMinutes = 1
 
 ########################################
 # Bidder/Buyer configuration

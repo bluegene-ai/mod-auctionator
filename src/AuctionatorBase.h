@@ -2,7 +2,6 @@
 #ifndef AUCTIONATORBASE_H
 #define AUCTIONATORBASE_H
 
-#include "AuctionatorBase.h"
 #include "Log.h"
 
 class AuctionatorBase
@@ -23,6 +22,11 @@ class AuctionatorBase
         void logInfo(std::string message) {
             std::string output = logPrefix + message;
             LOG_INFO("auctionator", output);
+        }
+
+        void logWarn(std::string message) {
+            std::string output = logPrefix + message;
+            LOG_WARN("auctionator", output);
         }
 
         void logTrace(std::string message) {
