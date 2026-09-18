@@ -2,9 +2,28 @@
 #include "AuctionatorEvents.h"
 #include "AuctionatorBidder.h"
 #include "AuctionatorSeller.h"
+#include "AuctionatorMarketData.h"
 #include "Log.h"
-#include <functional>
+#include <algorithm>
 #include <chrono>
+#include <exception>
+#include <string>
+
+namespace
+{
+    // Event ids. They are also the keys of eventToFunction/eventHandlers.
+    enum AuctionatorEventId : uint32
+    {
+        AUCTIONATOR_EVENT_ALLIANCE_BIDDER = 1,
+        AUCTIONATOR_EVENT_HORDE_BIDDER    = 2,
+        AUCTIONATOR_EVENT_NEUTRAL_BIDDER  = 3,
+        AUCTIONATOR_EVENT_ALLIANCE_SELLER = 4,
+        AUCTIONATOR_EVENT_HORDE_SELLER    = 5,
+        AUCTIONATOR_EVENT_NEUTRAL_SELLER  = 6,
+        AUCTIONATOR_EVENT_MARKET_IMPORT   = 7,
+        AUCTIONATOR_EVENT_COUNT           = 7
+    };
+}
 
 AuctionatorEvents::AuctionatorEvents(AuctionatorConfig* auctionatorConfig)
 {
@@ -13,9 +32,6 @@ AuctionatorEvents::AuctionatorEvents(AuctionatorConfig* auctionatorConfig)
     config = auctionatorConfig;
     InitializeEvents();
 }
-
-AuctionatorEvents::~AuctionatorEvents()
-{}
 
 void AuctionatorEvents::InitializeEvents()
 {
@@ -27,106 +43,128 @@ void AuctionatorEvents::InitializeEvents()
     logInfo("Initializing events");
 
     eventToFunction = {
-            {1, "AllianceBidder"},
-            {2, "HordeBidder"},
-            {3, "NeutralBidder"},
-            {4, "AllianceSeller"},
-            {5, "HordeSeller"},
-            {6, "NeutralSeller"}
+            {AUCTIONATOR_EVENT_ALLIANCE_BIDDER, "AllianceBidder"},
+            {AUCTIONATOR_EVENT_HORDE_BIDDER, "HordeBidder"},
+            {AUCTIONATOR_EVENT_NEUTRAL_BIDDER, "NeutralBidder"},
+            {AUCTIONATOR_EVENT_ALLIANCE_SELLER, "AllianceSeller"},
+            {AUCTIONATOR_EVENT_HORDE_SELLER, "HordeSeller"},
+            {AUCTIONATOR_EVENT_NEUTRAL_SELLER, "NeutralSeller"},
+            {AUCTIONATOR_EVENT_MARKET_IMPORT, "MarketImport"}
         };
 
     eventHandlers = {
-            {1, &AuctionatorEvents::EventAllianceBidder},
-            {2, &AuctionatorEvents::EventHordeBidder},
-            {3, &AuctionatorEvents::EventNeutralBidder},
-            {4, &AuctionatorEvents::EventAllianceSeller},
-            {5, &AuctionatorEvents::EventHordeSeller},
-            {6, &AuctionatorEvents::EventNeutralSeller}
+            {AUCTIONATOR_EVENT_ALLIANCE_BIDDER, &AuctionatorEvents::EventAllianceBidder},
+            {AUCTIONATOR_EVENT_HORDE_BIDDER, &AuctionatorEvents::EventHordeBidder},
+            {AUCTIONATOR_EVENT_NEUTRAL_BIDDER, &AuctionatorEvents::EventNeutralBidder},
+            {AUCTIONATOR_EVENT_ALLIANCE_SELLER, &AuctionatorEvents::EventAllianceSeller},
+            {AUCTIONATOR_EVENT_HORDE_SELLER, &AuctionatorEvents::EventHordeSeller},
+            {AUCTIONATOR_EVENT_NEUTRAL_SELLER, &AuctionatorEvents::EventNeutralSeller},
+            {AUCTIONATOR_EVENT_MARKET_IMPORT, &AuctionatorEvents::EventMarketImport}
         };
 
-    if (config->allianceBidder.enabled) {
-        events.ScheduleEvent(1, std::chrono::minutes(config->allianceBidder.cycleMinutes));
-    }
-    if (config->hordeBidder.enabled) {
-        events.ScheduleEvent(2, std::chrono::minutes(config->hordeBidder.cycleMinutes));
-    }
-    if (config->neutralBidder.enabled) {
-        events.ScheduleEvent(3, std::chrono::minutes(config->neutralBidder.cycleMinutes));
-    }
-    if (config->allianceSeller.enabled) {
-        events.ScheduleEvent(4, std::chrono::minutes(config->allianceSeller.cycleMinutes));
-    }
-    if (config->hordeSeller.enabled) {
-        events.ScheduleEvent(5, std::chrono::minutes(config->hordeSeller.cycleMinutes));
-    }
-    if (config->neutralSeller.enabled) {
-        events.ScheduleEvent(6, std::chrono::minutes(config->neutralSeller.cycleMinutes));
+    // uint16 matches EventMap's event id type.
+    for (uint16 eventId = 1; eventId <= AUCTIONATOR_EVENT_COUNT; ++eventId)
+    {
+        if (IsEventEnabled(eventId))
+        {
+            // The market import is the only event that wants an early first run, so a
+            // fresh deployment picks up the current export.
+            uint32 const firstDelayMinutes = eventId == AUCTIONATOR_EVENT_MARKET_IMPORT
+                ? 1
+                : GetEventInterval(eventId).count();
+
+            events.ScheduleEvent(eventId, std::chrono::minutes(firstDelayMinutes));
+        }
     }
 }
 
-std::chrono::minutes AuctionatorEvents::GetEventInterval(uint32 currentEvent) const
+bool AuctionatorEvents::IsEventEnabled(uint16 currentEvent) const
 {
+    if (!config)
+    {
+        return false;
+    }
+
     switch (currentEvent) {
-        case 1:
-            return std::chrono::minutes(config->allianceBidder.cycleMinutes);
-        case 2:
-            return std::chrono::minutes(config->hordeBidder.cycleMinutes);
-        case 3:
-            return std::chrono::minutes(config->neutralBidder.cycleMinutes);
-        case 4:
-            return std::chrono::minutes(config->allianceSeller.cycleMinutes);
-        case 5:
-            return std::chrono::minutes(config->hordeSeller.cycleMinutes);
-        case 6:
-            return std::chrono::minutes(config->neutralSeller.cycleMinutes);
+        case AUCTIONATOR_EVENT_ALLIANCE_BIDDER:
+            return config->allianceBidder.enabled != 0;
+        case AUCTIONATOR_EVENT_HORDE_BIDDER:
+            return config->hordeBidder.enabled != 0;
+        case AUCTIONATOR_EVENT_NEUTRAL_BIDDER:
+            return config->neutralBidder.enabled != 0;
+        case AUCTIONATOR_EVENT_ALLIANCE_SELLER:
+            return config->allianceSeller.enabled != 0;
+        case AUCTIONATOR_EVENT_HORDE_SELLER:
+            return config->hordeSeller.enabled != 0;
+        case AUCTIONATOR_EVENT_NEUTRAL_SELLER:
+            return config->neutralSeller.enabled != 0;
+        case AUCTIONATOR_EVENT_MARKET_IMPORT:
+            return !config->marketDataImportFile.empty();
+        default:
+            return false;
+    }
+}
+
+// A scheduled event may never fire immediately a second time: EventMap gives an
+// event back for as long as its due time is <= the map's internal clock, so an
+// interval of zero would make ExecuteEvents() loop on the same event forever and
+// hang the world thread.
+static std::chrono::minutes ClampEventInterval(uint32 minutes)
+{
+    return std::chrono::minutes(std::max<uint32>(1, minutes));
+}
+
+std::chrono::minutes AuctionatorEvents::GetEventInterval(uint16 currentEvent) const
+{
+    if (!config)
+    {
+        return std::chrono::minutes(1);
+    }
+
+    switch (currentEvent) {
+        case AUCTIONATOR_EVENT_ALLIANCE_BIDDER:
+            return ClampEventInterval(config->allianceBidder.cycleMinutes);
+        case AUCTIONATOR_EVENT_HORDE_BIDDER:
+            return ClampEventInterval(config->hordeBidder.cycleMinutes);
+        case AUCTIONATOR_EVENT_NEUTRAL_BIDDER:
+            return ClampEventInterval(config->neutralBidder.cycleMinutes);
+        case AUCTIONATOR_EVENT_ALLIANCE_SELLER:
+            return ClampEventInterval(config->allianceSeller.cycleMinutes);
+        case AUCTIONATOR_EVENT_HORDE_SELLER:
+            return ClampEventInterval(config->hordeSeller.cycleMinutes);
+        case AUCTIONATOR_EVENT_NEUTRAL_SELLER:
+            return ClampEventInterval(config->neutralSeller.cycleMinutes);
+        case AUCTIONATOR_EVENT_MARKET_IMPORT:
+            return ClampEventInterval(config->marketDataImportIntervalMinutes);
         default:
             return std::chrono::minutes(1);
     }
 }
 
-void AuctionatorEvents::RescheduleEvent(uint32 currentEvent)
+void AuctionatorEvents::RescheduleEvent(uint16 currentEvent)
 {
-    if (!config) {
-        return;
-    }
-
-    switch (currentEvent) {
-        case 1:
-            if (config->allianceBidder.enabled) {
-                events.ScheduleEvent(currentEvent, GetEventInterval(currentEvent));
-            }
-            break;
-        case 2:
-            if (config->hordeBidder.enabled) {
-                events.ScheduleEvent(currentEvent, GetEventInterval(currentEvent));
-            }
-            break;
-        case 3:
-            if (config->neutralBidder.enabled) {
-                events.ScheduleEvent(currentEvent, GetEventInterval(currentEvent));
-            }
-            break;
-        case 4:
-            if (config->allianceSeller.enabled) {
-                events.ScheduleEvent(currentEvent, GetEventInterval(currentEvent));
-            }
-            break;
-        case 5:
-            if (config->hordeSeller.enabled) {
-                events.ScheduleEvent(currentEvent, GetEventInterval(currentEvent));
-            }
-            break;
-        case 6:
-            if (config->neutralSeller.enabled) {
-                events.ScheduleEvent(currentEvent, GetEventInterval(currentEvent));
-            }
-            break;
-        default:
-            break;
+    if (IsEventEnabled(currentEvent))
+    {
+        events.ScheduleEvent(currentEvent, GetEventInterval(currentEvent));
     }
 }
 
-void AuctionatorEvents::DispatchEvent(uint32 currentEvent)
+bool AuctionatorEvents::SkipSharedHouseEvent(char const* what, uint32 houseId) const
+{
+    if (houseId == (uint32)AuctionHouseId::Neutral || !Auctionator::UsesSharedNeutralAuctionHouse())
+    {
+        return false;
+    }
+
+    // One line per event per cycle. Without this check the seller would log "count is good,
+    // here we go" and only then be refused by AuctionatorSeller, which reads like a bug.
+    logError(std::string(what ? what : "event") + " skipped for house " + std::to_string(houseId)
+        + ": AllowTwoSide.Interaction.Auction is enabled, so only house 7 (neutral) is visible to players. "
+          "Enable Auctionator.NeutralSeller / Auctionator.NeutralBidder and leave the 2/6 ones disabled.");
+    return true;
+}
+
+void AuctionatorEvents::DispatchEvent(uint16 currentEvent)
 {
     if (!config) {
         logError("AuctionatorEvents::DispatchEvent skipped: config is null.");
@@ -150,8 +188,11 @@ void AuctionatorEvents::DispatchEvent(uint32 currentEvent)
     try {
         (this->*(handlerIt->second))();
     } catch (const std::exception& e) {
+        // Still reschedule: an event that threw once (a database hiccup, a bad row) should
+        // not silently drop out of the schedule until the next enable/disable or restart.
         logError("Issue calling handler for event id " + std::to_string(currentEvent));
         logError(e.what());
+        RescheduleEvent(currentEvent);
         return;
     }
 
@@ -160,18 +201,61 @@ void AuctionatorEvents::DispatchEvent(uint32 currentEvent)
 
 void AuctionatorEvents::ExecuteEvents()
 {
-    logInfo("Executing events");
-    uint32 currentEvent = events.ExecuteEvent();
-    while (currentEvent != 0) {
+    //
+    // Seven events exist, so a single tick can only legitimately dispatch a handful of
+    // them. The cap is a safety net for a schedule that somehow became due immediately
+    // again (see ClampEventInterval above): it bounds the work done in one tick and
+    // reports the problem instead of spinning the world thread.
+    //
+    uint32 const maxEventsPerTick = 64;
+
+    uint16 currentEvent = events.ExecuteEvent();
+    for (uint32 dispatched = 0; currentEvent != 0; ++dispatched)
+    {
+        if (dispatched >= maxEventsPerTick)
+        {
+            logError("event dispatch cap (" + std::to_string(maxEventsPerTick)
+                + ") reached in one tick; the event schedule looks broken, aborting this tick.");
+            return;
+        }
+
         DispatchEvent(currentEvent);
         currentEvent = events.ExecuteEvent();
     }
 }
 
-void AuctionatorEvents::Update(uint32 deltaMinutes)
+void AuctionatorEvents::Update(uint32 deltaMilliseconds)
 {
-    events.Update(deltaMinutes);
+    events.Update(deltaMilliseconds);
     ExecuteEvents();
+}
+
+void AuctionatorEvents::ResyncSchedule()
+{
+    if (!config) {
+        return;
+    }
+
+    //
+    // Called after ".auctionator enable/disable": events are only scheduled from the
+    // flags at startup, so without this a flag turned on at runtime never ran.
+    //
+    for (uint16 eventId = 1; eventId <= AUCTIONATOR_EVENT_COUNT; ++eventId)
+    {
+        if (!IsEventEnabled(eventId))
+        {
+            events.CancelEvent(eventId);
+            continue;
+        }
+
+        // Not scheduled yet: run soon so the GM sees the effect, then the normal interval
+        // takes over through RescheduleEvent().
+        if (!events.HasTimeUntilEvent(eventId))
+        {
+            events.ScheduleEvent(eventId, std::chrono::minutes(1));
+            logInfo("event " + std::to_string(eventId) + " enabled, first run in about a minute");
+        }
+    }
 }
 
 void AuctionatorEvents::SetPlayerGuid(ObjectGuid playerGuid)
@@ -179,15 +263,14 @@ void AuctionatorEvents::SetPlayerGuid(ObjectGuid playerGuid)
     auctionatorGuid = playerGuid;
 }
 
-void AuctionatorEvents::SetHouses(AuctionatorHouses* auctionatorHouses)
-{
-    houses = auctionatorHouses;
-}
-
 void AuctionatorEvents::EventAllianceBidder()
 {
     if (!config) {
         logError("Alliance bidder skipped: config is null.");
+        return;
+    }
+
+    if (SkipSharedHouseEvent("Alliance bidder", (uint32)AuctionHouseId::Alliance)) {
         return;
     }
 
@@ -203,6 +286,10 @@ void AuctionatorEvents::EventHordeBidder()
         return;
     }
 
+    if (SkipSharedHouseEvent("Horde bidder", (uint32)AuctionHouseId::Horde)) {
+        return;
+    }
+
     logInfo("Starting Horde Bidder");
     AuctionatorBidder bidder = AuctionatorBidder((uint32)AuctionHouseId::Horde, auctionatorGuid, config);
     bidder.SpendSomeCash();
@@ -215,6 +302,10 @@ void AuctionatorEvents::EventNeutralBidder()
         return;
     }
 
+    if (SkipSharedHouseEvent("Neutral bidder", (uint32)AuctionHouseId::Neutral)) {
+        return;
+    }
+
     logInfo("Starting Neutral Bidder");
     AuctionatorBidder bidder = AuctionatorBidder((uint32)AuctionHouseId::Neutral, auctionatorGuid, config);
     bidder.SpendSomeCash();
@@ -222,16 +313,17 @@ void AuctionatorEvents::EventNeutralBidder()
 
 void AuctionatorEvents::EventAllianceSeller()
 {
-    if (!houses || !Auctionator::getInstance()->GetAuctionHouse((uint32)AuctionHouseId::Alliance)) {
+    // GetAuctionHouse() stays null until Initialize() resolved the house maps.
+    if (!config || !Auctionator::getInstance()->GetAuctionHouse((uint32)AuctionHouseId::Alliance)) {
         logError("Alliance auction house is not initialized.");
         return;
     }
 
-    AuctionatorSeller sellerAlliance =
-        AuctionatorSeller(Auctionator::getInstance(), static_cast<uint32>(AuctionHouseId::Alliance));
+    if (SkipSharedHouseEvent("Alliance seller", (uint32)AuctionHouseId::Alliance)) {
+        return;
+    }
 
-    uint32 auctionCountAlliance = Auctionator::getInstance()->GetAuctionHouse((uint32)AuctionHouseId::Alliance)->Getcount();
-
+    uint32 const auctionCountAlliance = Auctionator::getInstance()->CountAuctions((uint32)AuctionHouseId::Alliance);
     if (auctionCountAlliance < config->allianceSeller.maxAuctions) {
         logInfo(
             "Alliance count is good, here we go: "
@@ -239,6 +331,7 @@ void AuctionatorEvents::EventAllianceSeller()
             + " of " + std::to_string(config->allianceSeller.maxAuctions)
         );
 
+        AuctionatorSeller sellerAlliance = AuctionatorSeller(Auctionator::getInstance());
         sellerAlliance.LetsGetToIt(
             config->sellerConfig.auctionsPerRun,
             (uint32)AuctionHouseId::Alliance
@@ -246,21 +339,20 @@ void AuctionatorEvents::EventAllianceSeller()
     } else {
         logInfo("Alliance count over max: " + std::to_string(auctionCountAlliance));
     }
-    
 }
 
 void AuctionatorEvents::EventHordeSeller()
 {
-    if (!houses || !Auctionator::getInstance()->GetAuctionHouse((uint32)AuctionHouseId::Horde)) {
+    if (!config || !Auctionator::getInstance()->GetAuctionHouse((uint32)AuctionHouseId::Horde)) {
         logError("Horde auction house is not initialized.");
         return;
     }
 
-    AuctionatorSeller sellerHorde =
-        AuctionatorSeller(Auctionator::getInstance(), static_cast<uint32>(AuctionHouseId::Horde));
+    if (SkipSharedHouseEvent("Horde seller", (uint32)AuctionHouseId::Horde)) {
+        return;
+    }
 
-    uint32 auctionCountHorde = Auctionator::getInstance()->GetAuctionHouse((uint32)AuctionHouseId::Horde)->Getcount();
-
+    uint32 const auctionCountHorde = Auctionator::getInstance()->CountAuctions((uint32)AuctionHouseId::Horde);
     if (auctionCountHorde < config->hordeSeller.maxAuctions) {
         logInfo(
             "Horde count is good, here we go: "
@@ -268,6 +360,7 @@ void AuctionatorEvents::EventHordeSeller()
             + " of " + std::to_string(config->hordeSeller.maxAuctions)
         );
 
+        AuctionatorSeller sellerHorde = AuctionatorSeller(Auctionator::getInstance());
         sellerHorde.LetsGetToIt(
             config->sellerConfig.auctionsPerRun,
             (uint32)AuctionHouseId::Horde
@@ -279,16 +372,16 @@ void AuctionatorEvents::EventHordeSeller()
 
 void AuctionatorEvents::EventNeutralSeller()
 {
-    if (!houses || !Auctionator::getInstance()->GetAuctionHouse((uint32)AuctionHouseId::Neutral)) {
+    if (!config || !Auctionator::getInstance()->GetAuctionHouse((uint32)AuctionHouseId::Neutral)) {
         logError("Neutral auction house is not initialized.");
         return;
     }
 
-    AuctionatorSeller sellerNeutral =
-        AuctionatorSeller(Auctionator::getInstance(), static_cast<uint32>(AuctionHouseId::Neutral));
+    if (SkipSharedHouseEvent("Neutral seller", (uint32)AuctionHouseId::Neutral)) {
+        return;
+    }
 
-    uint32 auctionCountNeutral = Auctionator::getInstance()->GetAuctionHouse((uint32)AuctionHouseId::Neutral)->Getcount();
-
+    uint32 const auctionCountNeutral = Auctionator::getInstance()->CountAuctions((uint32)AuctionHouseId::Neutral);
     if (auctionCountNeutral < config->neutralSeller.maxAuctions) {
         logInfo(
             "Neutral count is good, here we go: "
@@ -296,17 +389,29 @@ void AuctionatorEvents::EventNeutralSeller()
             + " of " + std::to_string(config->neutralSeller.maxAuctions)
         );
 
+        AuctionatorSeller sellerNeutral = AuctionatorSeller(Auctionator::getInstance());
         sellerNeutral.LetsGetToIt(
             config->sellerConfig.auctionsPerRun,
             (uint32)AuctionHouseId::Neutral
         );
-
     } else {
         logInfo("Neutral count over max: " + std::to_string(auctionCountNeutral));
     }
 }
 
-EventMap AuctionatorEvents::GetEvents()
+void AuctionatorEvents::EventMarketImport()
 {
-    return events;
+    if (!config || config->marketDataImportFile.empty()) {
+        return;
+    }
+
+    logInfo("Starting market data import");
+
+    AuctionatorMarketData marketData;
+    marketData.ImportFromFile(
+        config->marketDataImportFile,
+        config->marketDataImportSource,
+        config->marketDataImportMaxRows,
+        false
+    );
 }

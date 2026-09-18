@@ -2,38 +2,96 @@
 #include "AuctionHouseMgr.h"
 #include "AuctionatorSeller.h"
 #include "Item.h"
+// MAX_MONEY_AMOUNT is a macro in Player.h and is declared nowhere else, so this include is
+// needed even though this file never touches a Player object.
+#include "Player.h"
 #include "DatabaseEnv.h"
-#include "PreparedStatement.h"
-#include <random>
-#include <algorithm>
-#include <cctype>
-#include <limits>
 #include "QueryResult.h"
+#include "Random.h"
+#include "Timer.h"
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
+namespace
+{
+    //
+    // Shared candidate pool. The pool (item_template joined with the module tables) does
+    // not depend on the auction house, but each of the three house events constructs its
+    // own AuctionatorSeller: without this cache every house on a one minute cycle ran the
+    // same heavy query. The time to live is one tick (the events are driven by the auction
+    // house manager's minute timer).
+    //
+    // Only the world thread runs the events and the GM commands, so this needs no locking.
+    //
+    std::vector<CachedItem> PoolCache;
+    uint32 PoolCacheMs = 0;
+    uint32 const PoolCacheTtlMs = 60 * 1000;
 
-AuctionatorSeller::AuctionatorSeller(Auctionator* natorParam, uint32 auctionHouseIdParam)
+    // Seconds in a day, used for the market data age check.
+    constexpr uint64 SecondsPerDay = 24 * 60 * 60;
+
+    // Quote a schema name so it can be used as a table qualifier.
+    //
+    // The names are never baked into the module: they are read at runtime from
+    // worldserver.conf (WorldDatabaseInfo / CharacterDatabaseInfo, fifth ';'
+    // separated field) through WorldDatabase/CharacterDatabase::GetConnectionInfo().
+    // They are operator input, so only names that cannot be quoted safely are refused.
+    bool QuoteDatabaseIdentifier(std::string const& name, std::string& quoted)
+    {
+        if (name.empty() || name.size() > 64
+            || name.find_first_of("`\\") != std::string::npos)
+        {
+            return false;
+        }
+
+        quoted = '`' + name + '`';
+        return true;
+    }
+
+    // Is the imported market price of this item usable (present and fresh enough)?
+    // marketAgeSeconds == 0 means the import carried no timestamp, in which case the row
+    // is trusted.
+    bool HasUsableMarketPrice(CachedItem const& item, uint32 maxAgeDays)
+    {
+        if (item.marketPrice == 0)
+        {
+            return false;
+        }
+
+        if (maxAgeDays == 0 || item.marketAgeSeconds == 0)
+        {
+            return true;
+        }
+
+        return static_cast<uint64>(item.marketAgeSeconds) <= static_cast<uint64>(maxAgeDays) * SecondsPerDay;
+    }
+
+    // Age of the market scan in whole days.
+    uint32 MarketDataAgeDays(CachedItem const& item)
+    {
+        return static_cast<uint32>(item.marketAgeSeconds / SecondsPerDay);
+    }
+
+    // Keep auction prices inside the range the client and AuctionHouseMgr expect.
+    uint32 ClampPrice(long long value)
+    {
+        if (value < 1)
+        {
+            return 1;
+        }
+
+        return static_cast<uint32>(std::min<long long>(value, MAX_MONEY_AMOUNT));
+    }
+}
+
+AuctionatorSeller::AuctionatorSeller(Auctionator* natorParam)
 {
     SetLogPrefix("[AuctionatorSeller] ");
     nator = natorParam;
-    auctionHouseId = auctionHouseIdParam;
-
-    ahMgr = nator->GetAuctionMgr(auctionHouseId);
-};
-
-AuctionatorSeller::~AuctionatorSeller()
-{
-    // TODO: clean up
-};
-
-static bool IsValidDatabaseIdentifier(const std::string& name)
-{
-    if (name.empty()) {
-        return false;
-    }
-
-    return std::all_of(name.begin(), name.end(), [](unsigned char ch) {
-        return std::isalnum(ch) || ch == '_';
-    });
 }
 
 void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
@@ -47,29 +105,69 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
         return;
     }
 
-    std::string characterDbName = CharacterDatabase.GetConnectionInfo()->database;
-    if (!IsValidDatabaseIdentifier(characterDbName)) {
-        logError("Invalid character database name for Auctionator seller SQL: " + characterDbName);
+    //
+    // On a realm that shares one auction house between the factions (the core then stores
+    // every auction with houseId = Neutral and only the neutral search partition is ever
+    // queried by clients), listing into Alliance or Horde would create auctions that
+    // nobody can see while still occupying the house quota. CreateAuction() refuses them
+    // as well; stopping here keeps the log to one clear line per cycle instead of one per
+    // attempted item, and avoids the (expensive) candidate query altogether.
+    //
+    if (houseId != (uint32)AuctionHouseId::Neutral && Auctionator::UsesSharedNeutralAuctionHouse())
+    {
+        logError("seller skipped for house " + std::to_string(houseId)
+            + ": AllowTwoSide.Interaction.Auction is enabled, so only house 7 (neutral) is visible to players. "
+              "Enable Auctionator.NeutralSeller and leave the alliance/horde sellers disabled.");
         return;
     }
 
-    std::vector<CachedItem> cachedItems;
+    // Schema names come from worldserver.conf, never from the module: the pools
+    // carry the database parsed out of WorldDatabaseInfo / CharacterDatabaseInfo.
+    std::string characterDbName;
+    std::string worldDbName;
+    if (!QuoteDatabaseIdentifier(CharacterDatabase.GetConnectionInfo()->database, characterDbName)
+        || !QuoteDatabaseIdentifier(WorldDatabase.GetConnectionInfo()->database, worldDbName))
+    {
+        logError("cannot resolve the world/characters schema names from worldserver.conf "
+            "(WorldDatabaseInfo / CharacterDatabaseInfo); seller skipped for this cycle.");
+        return;
+    }
+
+    //
+    // The item/class configuration and the market price table live in different databases
+    // (world vs characters), so every table is fully qualified with the names read from
+    // worldserver.conf above, and the query runs on the *world* connection (the world
+    // account needs SELECT on the characters schema).
+    //
+    // Scan age is computed by the database (TIMESTAMPDIFF against NOW()) so that both
+    // sides of the age check use one clock.
+    //
+    std::string const verifiedBuildFilter = nator->config->sellerConfig.excludeUnverifiedItems
+        ? " AND it.VerifiedBuild != 1"
+        : "";
 
     std::string cacheQuery = R"(
         SELECT
-            it.entry, it.name, it.BuyPrice, it.stackable, it.quality
-            , COALESCE(mp.average_price, 0) as average_price, aicconf.max_count
+            it.entry, it.name, it.BuyPrice, it.SellPrice, it.stackable, it.quality
+            , COALESCE(mp.average_price, 0) as average_price
+            , COALESCE(mp.item_count, 0) as item_count
+            , COALESCE(GREATEST(0, TIMESTAMPDIFF(SECOND, mp.scan_datetime, NOW())), 0) as scan_age_seconds
+            , aicconf.max_count
+            , COALESCE(aicconf.stack_count, 0) as stack_count
         FROM
-            mod_auctionator_itemclass_config aicconf
-            INNER JOIN item_template it ON
+            {}.mod_auctionator_itemclass_config aicconf
+            INNER JOIN {}.item_template it ON
                 aicconf.class = it.class
                 AND aicconf.subclass = it.subclass
                 AND it.bonding != 1
-                AND (it.bonding >= aicconf.bonding OR it.bonding = 0)
-                AND it.VerifiedBuild != 1
-            LEFT JOIN mod_auctionator_disabled_items dis ON it.entry = dis.item
+                AND (aicconf.bonding = 0 OR it.bonding >= aicconf.bonding)
+        )" + verifiedBuildFilter + R"(
+            LEFT JOIN {}.mod_auctionator_disabled_items dis ON it.entry = dis.item
             LEFT JOIN (
-                SELECT mp1.entry, mp1.average_price
+                SELECT mp1.entry
+                    , mp1.average_price
+                    , mp1.`count` as item_count
+                    , mp1.scan_datetime
                 FROM {}.mod_auctionator_market_price mp1
                 INNER JOIN (
                     SELECT entry, MAX(scan_datetime) as max_scan
@@ -80,10 +178,40 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
         WHERE dis.item IS NULL
     )";
 
-    QueryResult result = CharacterDatabase.Query(cacheQuery, characterDbName, characterDbName);
+    //
+    // The pool is fetched at most once per tick and shared by all three houses. A failed
+    // query is deliberately not cached, so the next house retries.
+    //
+    uint32 const nowMs = getMSTime();
+    bool const poolIsFresh = !PoolCache.empty() && PoolCacheMs != 0
+        && getMSTimeDiff(PoolCacheMs, nowMs) < PoolCacheTtlMs;
 
-    if (result)
+    if (poolIsFresh)
     {
+        logDebug("seller pool served from cache: " + std::to_string(PoolCache.size())
+            + " item(s), age " + std::to_string(getMSTimeDiff(PoolCacheMs, nowMs)) + "ms");
+    }
+    else
+    {
+        PoolCache.clear();
+        PoolCacheMs = 0;
+
+        QueryResult result = WorldDatabase.Query(cacheQuery,
+            worldDbName, worldDbName, worldDbName, characterDbName, characterDbName);
+
+        if (!result)
+        {
+            // DatabaseWorkerPool::Query() returns a null result both when the query fails
+            // and when it matches zero rows (the first NextRow() is part of that check).
+            // The usual causes are: the mod_auctionator_* tables are missing or empty in
+            // the world database, or the world DB user has no SELECT grant on the
+            // characters schema (MySQL errors are printed by the sql logger).
+            logWarn("seller item query produced no rows for house "
+                + std::to_string(houseId)
+                + " (query failed or nothing matched; check mod_auctionator_itemclass_config in the world database and the sql log).");
+            return;
+        }
+
         do
         {
             Field* fields = result->Fetch();
@@ -91,14 +219,28 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
             item.entry = fields[0].Get<uint32>();
             item.name = fields[1].Get<std::string>();
             item.basePrice = fields[2].Get<uint32>();
-            item.stackable = fields[3].Get<uint32>();
-            item.quality = fields[4].Get<uint32>();
-            item.marketPrice = fields[5].Get<uint32>();
-            item.maxCount = fields[6].Get<uint32>();
-            cachedItems.push_back(item);
+            item.sellPrice = fields[3].Get<uint32>();
+            item.stackable = fields[4].Get<uint32>();
+            item.quality = fields[5].Get<uint32>();
+            item.marketPrice = fields[6].Get<uint32>();
+            item.marketCount = fields[7].Get<uint32>();
+            item.marketAgeSeconds = fields[8].Get<uint32>();
+            item.maxCount = fields[9].Get<uint32>();
+            item.stackCount = fields[10].Get<uint32>();
+            PoolCache.push_back(item);
         } while (result->NextRow());
+
+        if (PoolCache.empty())
+        {
+            logWarn("seller item query returned no usable rows for house " + std::to_string(houseId) + ".");
+            return;
+        }
+
+        PoolCacheMs = nowMs;
+        logDebug("seller pool refreshed: " + std::to_string(PoolCache.size()) + " item(s)");
     }
 
+    std::vector<CachedItem> const& cachedItems = PoolCache;
 
     std::string countQuery = R"(
         SELECT ii.itemEntry, COUNT(*) as itemCount
@@ -120,96 +262,205 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
         } while (countResult->NextRow());
     }
 
-    std::vector<CachedItem> shuffled = cachedItems;
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::shuffle(shuffled.begin(), shuffled.end(), gen);
+    //
+    // Selection: items with fresh market data are preferred, weighted by their traded
+    // volume, so the bot lists what actually trades on the reference market. Items without
+    // (or with stale) market data keep a baseline weight of 1.
+    //
+    uint32 const maxAgeDays = nator->config->marketDataMaxAgeDays;
+    bool const preferMarketItems = nator->config->sellerConfig.preferMarketItems != 0;
 
-    uint32 count = 0;
-    for (const auto& item : shuffled)
+    struct Candidate
     {
-        uint32 currentCount = currentCounts[item.entry];
-        if (currentCount >= item.maxCount) continue;
+        size_t cachedIndex = 0;
+        uint64 weight = 1;
+    };
 
-        std::string itemName = item.name;
+    std::vector<Candidate> candidates;
+    candidates.reserve(cachedItems.size());
 
-        uint32 stackSize = std::max<uint32>(1, item.stackable);
-        if (stackSize > 20) {
-            stackSize = 20;
+    uint32 skippedByQuota = 0;
+    for (size_t i = 0; i < cachedItems.size(); ++i)
+    {
+        CachedItem const& item = cachedItems[i];
+        if (currentCounts[item.entry] >= item.maxCount)
+        {
+            skippedByQuota++;
+            continue;
+        }
+
+        uint64 weight = 1;
+        if (preferMarketItems && HasUsableMarketPrice(item, maxAgeDays))
+        {
+            // Volume bias, capped so one very liquid item cannot dominate every run.
+            weight = 1 + std::min<uint64>(item.marketCount, 1000);
+        }
+
+        candidates.push_back({ i, weight });
+    }
+
+    logDebug("Seller selection houseId(" + std::to_string(houseId)
+        + "): cached=" + std::to_string(cachedItems.size())
+        + " candidates=" + std::to_string(candidates.size())
+        + " skippedByQuota=" + std::to_string(skippedByQuota)
+        + " preferMarketItems=" + std::to_string(preferMarketItems ? 1 : 0));
+
+    if (candidates.empty())
+    {
+        logInfo("No candidate items to list for houseId(" + std::to_string(houseId) + ") this run.");
+        return;
+    }
+
+    //
+    // Weighted random draw without replacement (Efraimidis & Spirakis): give every
+    // candidate the key -ln(U)/weight with U uniform in (0, 1] and take the smallest keys.
+    // That is equivalent to drawing items one by one with a probability proportional to
+    // their weight, and guarantees that no item is drawn twice in the same run.
+    //
+    std::vector<std::pair<double, size_t>> ranked;    // (key, index into candidates)
+    ranked.reserve(candidates.size());
+
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        // rand_norm() is [0, 1), so this is (0, 1] and log() stays finite.
+        double const u = 1.0 - rand_norm();
+        ranked.emplace_back(-std::log(u) / static_cast<double>(candidates[i].weight), i);
+    }
+
+    size_t const pickCount = std::min<size_t>(maxCount, ranked.size());
+    std::partial_sort(ranked.begin(), ranked.begin() + pickCount, ranked.end());
+
+    //
+    // Create the auctions for the selected items
+    //
+    uint32 created = 0;
+
+    float const bidStartModifier = std::clamp(nator->config->sellerConfig.bidStartModifier, 0.0f, 1.0f);
+    float const minPriceModifier = nator->config->sellerConfig.minPriceModifier;
+    float const maxPriceModifier = nator->config->sellerConfig.maxPriceModifier;
+    uint32 const defaultPrice = nator->config->sellerConfig.defaultPrice;
+
+    //
+    // One transaction for the whole run, so a failure - and a rollback - stays local to
+    // this house's run.
+    //
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+    for (size_t pick = 0; pick < pickCount; ++pick)
+    {
+        CachedItem const& item = cachedItems[candidates[ranked[pick].second].cachedIndex];
+        std::string const& itemName = item.name;
+
+        //
+        // Stack size: mod_auctionator_itemclass_config.stack_count is the stack this
+        // class/subclass is listed in, still bounded by what the item can stack to. A row
+        // without a value (0/NULL) falls back to the item's own max stack.
+        //
+        uint32 const itemMaxStack = std::max<uint32>(1, item.stackable);
+        uint32 stackSize = item.stackCount > 0 ? item.stackCount : itemMaxStack;
+        if (stackSize > itemMaxStack) {
+            stackSize = itemMaxStack;
         }
 
         if (stackSize > 1 && nator->config->sellerConfig.randomizeStackSize) {
             stackSize = GetRandomNumber(1, stackSize);
-            logDebug("Stack size: " + std::to_string(stackSize));
         }
 
-        const float bidStartModifier = std::clamp(nator->config->sellerConfig.bidStartModifier, 0.0f, 1.0f);
+        //
+        // Price: the per quality multiplier only ever scales the *fallback* price (vendor
+        // BuyPrice, or Auctionator.Seller.DefaultPrice). An imported market price is used
+        // as-is, so market driven pricing stays market driven.
+        //
+        float const qualityMultiplier = Auctionator::GetQualityMultiplier(nator->config->sellerMultipliers, item.quality);
+        bool const useMarketPrice = HasUsableMarketPrice(item, maxAgeDays);
 
-        float qualityMultiplier = Auctionator::GetQualityMultiplier(nator->config->sellerMultipliers, item.quality);
-
-        uint32 price = item.marketPrice > 0 ? item.marketPrice : item.basePrice;
-        if (item.marketPrice > 0) {
-            logDebug("Using Market over Template [" + itemName + "] " +
-                std::to_string(item.marketPrice) + " <--> " + std::to_string(item.basePrice));
+        uint32 unitPrice = useMarketPrice ? item.marketPrice : item.basePrice;
+        if (unitPrice == 0) {
+            unitPrice = defaultPrice;
         }
 
-        if (price == 0) {
-            const double defaultPrice = 10000000.0 * qualityMultiplier;
-            price = static_cast<uint32>(std::min(defaultPrice, static_cast<double>(std::numeric_limits<uint32>::max())));
+        if (!useMarketPrice && qualityMultiplier > 0.0f) {
+            unitPrice = ClampPrice(std::llround(static_cast<double>(unitPrice) * static_cast<double>(qualityMultiplier)));
         }
 
-        uint32 bidPrice = price;
-        logDebug("Bid start modifier: " + std::to_string(bidStartModifier));
+        //
+        // Price ceiling first (it is only meaningful when the price actually came from the
+        // market), then the vendor floor, so the floor always holds: a market average far
+        // below the vendor sell price must not make the bot list below what a vendor pays,
+        // because a player could then buy the listing and vendor it at a profit.
+        //
+        uint32 const floorPrice = ClampPrice(std::llround(static_cast<double>(item.sellPrice) * static_cast<double>(minPriceModifier)));
 
-        const uint32 bidLowerBound = static_cast<uint32>(std::max(0.0, static_cast<double>(bidPrice) * (1.0 - bidStartModifier)));
-        const uint32 bidUpperBound = bidPrice;
-        uint32 safeBidLower = std::min(bidLowerBound, bidUpperBound);
-        uint32 safeBidUpper = std::max(bidLowerBound, bidUpperBound);
-        bidPrice = GetRandomNumber(safeBidLower, safeBidUpper);
-        logDebug("Bid price " + std::to_string(bidPrice) + " from price " + std::to_string(price));
+        if (useMarketPrice && maxPriceModifier > 0.0f) {
+            uint32 const ceilingPrice = ClampPrice(std::llround(static_cast<double>(item.marketPrice) * static_cast<double>(maxPriceModifier)));
+            if (unitPrice > ceilingPrice) {
+                unitPrice = ceilingPrice;
+            }
+        }
 
-        AuctionatorItem newItem = AuctionatorItem();
+        if (unitPrice < floorPrice) {
+            unitPrice = floorPrice;
+        }
+
+        if (useMarketPrice) {
+            logDebug("Market price [" + itemName + "]: " + std::to_string(item.marketPrice)
+                + " (volume " + std::to_string(item.marketCount)
+                + ", age " + std::to_string(MarketDataAgeDays(item)) + "d)"
+                + " template buy " + std::to_string(item.basePrice)
+                + " floor " + std::to_string(floorPrice)
+                + " -> unit " + std::to_string(unitPrice));
+        } else if (item.marketPrice > 0) {
+            logDebug("Ignoring stale market price [" + itemName + "]: age "
+                + std::to_string(MarketDataAgeDays(item)) + "d > "
+                + std::to_string(maxAgeDays) + "d.");
+        } else {
+            logDebug("No market price [" + itemName + "]: template buy "
+                + std::to_string(item.basePrice) + " floor " + std::to_string(floorPrice)
+                + " -> unit " + std::to_string(unitPrice));
+        }
+
+        //
+        // Starting bid: between (1 - bidStartModifier) and the unit price, never 0. A start
+        // bid of 0 is accepted by the core as "any bid wins", so a player could take the
+        // stack for 1 copper on the next expiry.
+        //
+        uint32 const bidLowerBound = std::max<uint32>(1,
+            static_cast<uint32>(std::max(0.0, static_cast<double>(unitPrice) * (1.0 - bidStartModifier))));
+        uint32 const safeBidLower = std::min(bidLowerBound, unitPrice);
+        uint32 const safeBidUpper = std::max(bidLowerBound, unitPrice);
+        uint32 const bidPrice = GetRandomNumber(safeBidLower, safeBidUpper);
+
+        AuctionatorItem newItem;
         newItem.itemId = item.entry;
-        newItem.quantity = 1;
         newItem.houseId = houseId;
 
-        const uint64 stackTotalPrice = static_cast<uint64>(price) * static_cast<uint64>(stackSize);
-        const long double buyoutMultiplier = std::max<long double>(1.0L, static_cast<long double>(qualityMultiplier));
-        const long double bidMultiplier = std::max<long double>(1.0L, static_cast<long double>(qualityMultiplier));
-        const uint64 buyoutValue = static_cast<uint64>(std::llround(static_cast<long double>(stackTotalPrice) * buyoutMultiplier));
-        const uint64 bidValue = static_cast<uint64>(std::llround(static_cast<long double>(bidPrice) * static_cast<long double>(stackSize) * bidMultiplier));
-        newItem.buyout = static_cast<uint32>(std::min<uint64>(buyoutValue, std::numeric_limits<uint32>::max()));
-        newItem.bid = static_cast<uint32>(std::min<uint64>(bidValue, std::numeric_limits<uint32>::max()));
-        if (newItem.buyout == 0) {
-            newItem.buyout = std::max<uint32>(1, static_cast<uint32>(stackTotalPrice));
-        }
-        if (newItem.bid == 0) {
-            newItem.bid = std::max<uint32>(1, static_cast<uint32>(std::max<uint64>(1ULL, static_cast<uint64>(bidPrice) * static_cast<uint64>(stackSize))));
-        }
+        uint32 const buyoutValue = ClampPrice(static_cast<long long>(static_cast<uint64>(unitPrice) * static_cast<uint64>(stackSize)));
+        uint32 const bidValue = ClampPrice(static_cast<long long>(static_cast<uint64>(bidPrice) * static_cast<uint64>(stackSize)));
+        newItem.buyout = buyoutValue;
+        newItem.bid = std::min<uint32>(bidValue, newItem.buyout);
         newItem.time = 60 * 60 * 12;
         newItem.stackSize = stackSize;
 
         logDebug("Adding item: " + itemName
-            + " with quantity of " + std::to_string(newItem.quantity)
-            + " at price of " +  std::to_string(newItem.buyout)
+            + " stack " + std::to_string(newItem.stackSize)
+            + " bid " + std::to_string(newItem.bid)
+            + " buyout " + std::to_string(newItem.buyout)
             + " to house " + std::to_string(houseId)
         );
 
-        if (newItem.buyout > 0 || newItem.bid > 0) {
-            nator->CreateAuction(newItem);
-        }
-
-        count++;
-        if (count >= maxCount) {
-            break;
+        if (nator->CreateAuction(newItem, trans))
+        {
+            created++;
         }
     }
 
+    CharacterDatabase.CommitTransaction(trans);
+
     logInfo("Items added houseId("
         + std::to_string(houseId)
-        + ") this run: " + std::to_string(count));
-
-};
+        + ") this run: " + std::to_string(created)
+        + " of " + std::to_string(pickCount) + " selected.");
+}
 
 uint32 AuctionatorSeller::GetRandomNumber(uint32 min, uint32 max)
 {
@@ -217,12 +468,5 @@ uint32 AuctionatorSeller::GetRandomNumber(uint32 min, uint32 max)
         std::swap(min, max);
     }
 
-    if (max == min) {
-        return max;
-    }
-
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<uint32_t> dis(min, max);
-    return dis(gen);
+    return urand(min, max);
 }

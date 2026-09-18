@@ -1,6 +1,14 @@
 #
 # Copyright (C) 2016+ AzerothCore <www.azerothcore.org>, released under GNU AGPL v3 license: https://github.com/azerothcore/azerothcore-wotlk/blob/master/LICENSE-AGPL3
 #
+# Copy this file to <server>/configs/modules/mod_auctionator.conf and edit that copy:
+# the module reads the file *without* the .dist suffix. Missing file = all defaults,
+# and Auctionator.Enabled defaults to 0, i.e. the module stays silent.
+#
+# The Appender.* / Logger.* lines that configure the module's log output must live in
+# worldserver.conf: module configurations are loaded after the log system has been
+# initialised, so appender definitions here would be ignored.
+#
 
 [worldserver]
 
@@ -8,23 +16,42 @@
 # Auctionator configuration
 ########################################
 #
-#    Auctionator.Enable
-#        Description: Enable my module and print "Hello World" message at server start
-#        Default:     0 - Disabled
-#                     1 - Enabled
+#    Auctionator.Enabled
+#        Master switch for the whole module. With 0 the event loop does not run at
+#        all: no selling, no bidding and no timed market import. The individual
+#        seller/bidder switches below default to 0, so this only means "the module
+#        is allowed to work".
 #
-
 Auctionator.Enabled = 1
 
-# the top level account id
-# this is not actually used methinks
+#    Auctionator.CharacterId
+#        The ACCOUNT id (not a character id) the module's dummy WorldSession is created
+#        with: it is used for the RBAC permission lookup and written back as
+#        account.totaltime / account.online when that session is released on shutdown,
+#        so it has to be the real account that owns CharacterGuid below.
+#
 Auctionator.CharacterId = 2
 
-# the character id
+#    Auctionator.CharacterGuid
+#        The character GUID that owns the bot's listings and receives their auction
+#        mail. Use a dedicated, never played character: the mail script deletes that
+#        character's auction mail, which is what turns bot sales into a gold sink
+#        (while the character is online nothing is recycled, to protect a real player).
+#        A GUID that is not in the characters database is reported at startup, because
+#        the core then drops the sale mail silently (no gold, items lost).
+#
 Auctionator.CharacterGuid = 2
 
 ########################################
 # Seller configuration
+#
+# MaxAuctions: upper bound of auctions of that house before the seller skips its cycle.
+#   The bound is checked *before* a run, so a house can end up holding up to
+#   (MaxAuctions + Auctionator.Seller.AuctionsPerRun) auctions.
+#   With AllowTwoSide.Interaction.Auction = 1 the counts are still per house (the
+#   three houses share one in-memory object, so the module counts by house id), but
+#   only the neutral house is visible to players - see the shared-house note below.
+# CycleMinutes: how often that house is stocked. Clamped to at least 1.
 ########################################
 Auctionator.AllianceSeller.Enabled = 0
 Auctionator.AllianceSeller.MaxAuctions = 5000
@@ -39,41 +66,65 @@ Auctionator.NeutralSeller.MaxAuctions = 5000
 Auctionator.NeutralSeller.CycleMinutes = 1
 
 ########################################
-# Bidder/Buyer configuration
+# SHARED FACTION HOUSES (AllowTwoSide.Interaction.Auction = 1)
+#
+# With this core option the three auction houses are one object, the core stores every
+# auction with houseId = Neutral, and clients only ever search the neutral house. An
+# Alliance/Horde entry would therefore be an auction that nobody can see or bid on while
+# still occupying the house quota, so the module refuses to create one:
+#
+#   * ".auctionator add 2 ..." / "add 6 ..." answer with an error, "addlist" skips such rows;
+#   * Auctionator.CreateAuction() refuses it as a second line of defence;
+#   * the AllianceSeller/HordeSeller and AllianceBidder/HordeBidder events log one error per
+#     cycle and do nothing.
+#
+# On such a realm enable Auctionator.NeutralSeller / Auctionator.NeutralBidder only.
+# (".auctionator expireall 2|6" still works, which is what you want to clean up rows left
+# over from before the option was switched on.)
 ########################################
-Auctionator.AllianceBidder.Enabled = 1
+
+########################################
+# Bidder/Buyer configuration
+#
+# ECONOMY WARNING - think before enabling these.
+#
+# The bidder has no money of its own: it never pays for what it buys, while the
+# core pays the seller the full bid from SendAuctionSuccessfulMail(). Buying a
+# player auction therefore MINTS gold out of nothing, and the item the bot wins
+# is sunk (the bot has no use for items, so its auction mail is recycled).
+#
+# An unfunded bid also changes what a PLAYER pays: when a player outbids the bot,
+# the core refunds the bot's bid - money that was never escrowed. That refund is
+# destroyed by the mail recycling, so it stays harmless - but it becomes real
+# minted gold if the auctionator character's auction mail is delivered instead of
+# recycled (which happens while that character is online).
+#
+# Recommendation: keep the bidders disabled (0) unless you explicitly want the
+# bot to buy player auctions and accept the inflation.
+########################################
+Auctionator.AllianceBidder.Enabled = 0
 Auctionator.AllianceBidder.CycleMinutes = 30
 Auctionator.AllianceBidder.MaxPerCycle = 2
 
-Auctionator.HordeBidder.Enabled = 1
+Auctionator.HordeBidder.Enabled = 0
 Auctionator.HordeBidder.CycleMinutes = 30
 Auctionator.HordeBidder.MaxPerCycle = 2
 
-Auctionator.NeutralBidder.Enabled = 1
+Auctionator.NeutralBidder.Enabled = 0
 Auctionator.NeutralBidder.CycleMinutes = 30
 Auctionator.NeutralBidder.MaxPerCycle = 2
 
+########################################
+# Base price for items that have neither a vendor BuyPrice nor market data.
+# It is then scaled by the per quality seller multiplier below.
+# Default is 100 gold (1000000 copper).
+########################################
+Auctionator.Seller.DefaultPrice = 1000000
 
 ########################################
-# Limit on the number of items the seller can retrieve in a
-# single query. Not sure this needs to be configurable. but
-# this may be helpful for changing randomness of the auctions.
-# Default is 1000 items.
-########################################
-Auctionator.Seller.QueryLimit = 1000
-
-########################################
-# Default price for items that have a BuyPrice of 0.
-# Default is 1000 gold.
-########################################
-Auctionator.Seller.DefaultPrice = 10000000
-
-########################################
-# Number of auctions added to the AH per run. This needs to
-# be less than the Seller.QueryLimit or you will run out of
-# items. In theory this also needs to be less thatn the number
-# of available items not in the AH though I am not really sure
-# what happens if it's not.
+# Number of auctions added to the AH per run, per house, per cycle.
+# The seller walks the whole candidate set (weighted by market volume when
+# PreferMarketItems is on) and lists this many of them.
 # Default is 100 per house per cycle.
 ########################################
 Auctionator.Seller.AuctionsPerRun = 100
@@ -81,8 +132,12 @@ Auctionator.Seller.AuctionsPerRun = 100
 ########################################
 # Do we want to randomize the size of stacks?
 #
-# 1 - Yes, make stack size somewhere between 1 and the max stack size.
-# 0 - No, make stack size always the max stack size for an item
+# The stack a listing is created with comes from
+# mod_auctionator_itemclass_config.stack_count (per class/subclass), clamped by the
+# item's own max stack.
+#
+# 1 - Yes, list a random stack between 1 and that size.
+# 0 - No, always list the full configured stack size.
 ########################################
 Auctionator.Seller.RandomizeStackSize = 1
 
@@ -94,8 +149,123 @@ Auctionator.Seller.RandomizeStackSize = 1
 #
 # e.g. if the price of an item is 100 then the
 # start bid price will be somewhere between 70 and 100
+#
+# The start bid is never 0: the core accepts any bid that is not below
+# auction->startbid, so a start bid of 0 would let a player take the auction for 1 copper.
+# The same value also drives the start bid of the GM listings (".auctionator add" /
+# "addlist"), which have no other protection against a 1 copper bid.
+# Set it to 0 to make every listing buyout-only (the start bid equals the buyout).
 ########################################
 Auctionator.Seller.BidStartModifier = .3
+
+########################################
+# MARKET DRIVEN PRICING
+#
+# Prices come from mod_auctionator_market_price.average_price when the imported
+# scan for that item is fresh enough, and from item_template.BuyPrice otherwise.
+#
+# Auctionator.MarketData.MaxAgeDays
+#     Ignore market data older than this many days: the seller falls back to
+#     item_template.BuyPrice and the bidder to its vendor price cap. 0 disables the
+#     age check. Default: 14
+#
+# Auctionator.Seller.PreferMarketItems
+#     1 - bias item selection towards entries that have fresh market data, weighted
+#         by the traded volume (mod_auctionator_market_price.count).
+#     0 - plain uniform random selection over all eligible items.
+#     Default: 1
+#
+# Auctionator.Seller.ExcludeUnverifiedItems
+#     1 - skip item_template rows with VerifiedBuild = 1.
+#     0 - no such filter. Default: 0
+#     In most world databases VerifiedBuild = 1 means "not verified by the content
+#     team" rather than "invalid item", and the filter can drop ~30% of the
+#     otherwise eligible items, so it is off unless the data says otherwise.
+#
+# Auctionator.Seller.MinPriceModifier
+#     Price floor, applied to item_template.SellPrice (the vendor sell price).
+#     1.0 = never list below what a vendor would pay. Default: 1.0
+#
+# Auctionator.Seller.MaxPriceModifier
+#     Price ceiling, applied to the market average. Only used for items that have
+#     market data. 0 disables the ceiling. Default: 2.0
+#     The ceiling is applied before the floor, so the floor always wins: even when the
+#     imported market average is far below the vendor sell price, the listing never goes
+#     below what a vendor pays.
+#
+# Auctionator.MarketData.ImportFile
+#     CSV export to import into mod_auctionator_market_price on a timer, so the
+#     server does not need an external cron job or the mysql client.
+#     Absolute path, or relative to the worldserver working directory.
+#     Empty = disabled (use the apps/marketprice script instead).
+#     Columns, with an optional header line:
+#         scan_datetime,item_entry,avg_price,minimum_buyout,minimum_bid,item_count
+#     Default: "" (disabled)
+#
+# Auctionator.MarketData.ImportSource
+#     Value stored in the `source` column, so several feeds can be told apart.
+#     Default: file
+#
+# Auctionator.MarketData.ImportIntervalMinutes
+#     How often the file is examined. An unchanged file (same size and mtime) is
+#     skipped, so the interval can be short without cost. Minimum 5. The first
+#     import runs about one minute after startup. Default: 360 (6 hours)
+#
+# Auctionator.MarketData.ImportMaxRows
+#     Safety cap per import. The import reads the file on the world thread, so a
+#     huge file stalls it for as long as it takes to write these rows.
+#     Default: 50000
+#
+# Auctionator.MarketData.RetentionDays
+#     Default retention used by ".auctionator marketprune [days]". Importing keeps
+#     history (one row per item and scan), so old rows should be pruned now and
+#     then. Default: 30
+#
+# NOTE on scan_datetime: the stored timestamp is interpreted in the database
+# server's time zone. The age of a scan is computed by the database itself
+# (TIMESTAMPDIFF against NOW()), so the importer and the readers agree only if the
+# CSV carries local time of the database host.
+########################################
+Auctionator.MarketData.MaxAgeDays = 14
+Auctionator.MarketData.ImportFile = ""
+Auctionator.MarketData.ImportSource = file
+Auctionator.MarketData.ImportIntervalMinutes = 360
+Auctionator.MarketData.ImportMaxRows = 50000
+Auctionator.MarketData.RetentionDays = 30
+Auctionator.Seller.PreferMarketItems = 1
+Auctionator.Seller.ExcludeUnverifiedItems = 0
+Auctionator.Seller.MinPriceModifier = 1.0
+Auctionator.Seller.MaxPriceModifier = 2.0
+
+########################################
+# ITEM SELECTION (world database)
+#
+# mod_auctionator_itemclass_config  (class, subclass, bonding, max_count, stack_count)
+#     One row per item class/subclass (`.class` and `.subclass` are
+#     item_template.class / .subclass; see mod_auctionator_item_class for names).
+#       bonding      minimum item_template.bonding for that row. Items with
+#                    bonding = 1 (bind on pickup) are always excluded, and
+#                    bonding = 0 means "no additional constraint". The shipped rows
+#                    only use 0 and 1, so the column currently acts as a flag for
+#                    "unbound items are allowed / not allowed" in that class.
+#       max_count    maximum number of auctions of that item entry in the house:
+#                    the seller skips an item while it already has max_count
+#                    auctions listed. max_count = 0 therefore means "never list
+#                    this class/subclass" (it is a quota, not "unlimited").
+#       stack_count  how many items go into one listing (weapons and armour are
+#                    configured with 1, trade goods and potions with 20, elixirs
+#                    with 10, ...). It is clamped by the item's own max stack, and a
+#                    row with 0 falls back to that max stack (the column is
+#                    NOT NULL DEFAULT 1, so NULL cannot occur).
+#                    Auctionator.Seller.RandomizeStackSize decides whether the full
+#                    value is used or a random 1..value.
+#
+# mod_auctionator_disabled_items  (item)
+#     Flat blacklist: any item_template.entry listed here is never auctioned.
+#
+# Both tables can be edited live; the seller picks the changes up on its next
+# cycle (no restart needed).
+########################################
 
 ########################################
 # Allows the bidder to bid on their own auctions.
@@ -107,6 +277,13 @@ Auctionator.Bidder.BidOnOwn = 0
 
 ########################################
 # Multipliers for seller
+#
+# These scale the *fallback* price only: item_template.BuyPrice for items without
+# market data, or Auctionator.Seller.DefaultPrice when the item has no vendor price
+# either. An imported market price is used exactly as imported, so market driven
+# pricing stays market driven.
+#
+# Set them all to 1.0 if you want the pure vendor price for items without market data.
 ########################################
 Auctionator.Multipliers.Seller.Poor = 1.0
 Auctionator.Multipliers.Seller.Normal = 1.0
@@ -117,6 +294,15 @@ Auctionator.Multipliers.Seller.Legendary = 15.0
 
 ########################################
 # Multipliers for bidder prices
+#
+# These cap what the bidder is willing to pay over item_template.BuyPrice or the
+# imported market average.
+#
+# They are applied as configured, including values below 1.0 (which make the bidder
+# pay *less* than the vendor/market reference) and 0.0 (which makes it buy nothing).
+# The only hard limit is that the resulting price is at least 1 copper.
+# The seller multipliers behave the same way, but they only scale the fallback price
+# of items that have no usable market data.
 ########################################
 Auctionator.Multipliers.Bidder.Poor = 1.0
 Auctionator.Multipliers.Bidder.Normal = 1.0
@@ -125,95 +311,14 @@ Auctionator.Multipliers.Bidder.Rare = 6.0
 Auctionator.Multipliers.Bidder.Epic = 10.0
 Auctionator.Multipliers.Bidder.Legendary = 15.0
 
-###################################################################################################
-# LOGGING SYSTEM SETTINGS
+########################################
+# LOGGING (worldserver.conf)
 #
-#  Appender config values: Given an appender "name"
-#    Appender.name
-#        Description: Defines 'where to log'.
-#        Format:      Type,LogLevel,Flags,optional1,optional2,optional3
+# The module logs to the "auctionator" logger. Add these three lines to
+# worldserver.conf if you want a separate auctionator.log and the debug levels;
+# without them the output goes to the root appenders (Server.log / console):
 #
-#                     Type
-#                         0 - (None)
-#                         1 - (Console)
-#                         2 - (File)
-#                         3 - (DB)
-#
-#                     LogLevel
-#                         0 - (Disabled)
-#                         1 - (Fatal)
-#                         2 - (Error)
-#                         3 - (Warning)
-#                         4 - (Info)
-#                         5 - (Debug)
-#                         6 - (Trace)
-#
-#                     Flags:
-#                         0 - None
-#                         1 - Prefix Timestamp to the text
-#                         2 - Prefix Log Level to the text
-#                         4 - Prefix Log Filter type to the text
-#                         8 - Append timestamp to the log file name. Format: YYYY-MM-DD_HH-MM-SS
-#                             (Only used with Type = 2)
-#                        16 - Make a backup of existing file before overwrite
-#                             (Only used with Mode = w)
-#
-#                     Colors (read as optional1 if Type = Console)
-#                         Format: "fatal error warn info debug trace"
-#                         0 - BLACK
-#                         1 - RED
-#                         2 - GREEN
-#                         3 - BROWN
-#                         4 - BLUE
-#                         5 - MAGENTA
-#                         6 - CYAN
-#                         7 - GREY
-#                         8 - YELLOW
-#                         9 - LRED
-#                        10 - LGREEN
-#                        11 - LBLUE
-#                        12 - LMAGENTA
-#                        13 - LCYAN
-#                        14 - WHITE
-#                         Example: "1 9 3 6 5 8"
-#
-#                     File: Name of the file (read as optional1 if Type = File)
-#                         Allows to use one "%s" to create dynamic files
-#
-#                     Mode: Mode to open the file (read as optional2 if Type = File)
-#                          a - (Append)
-#                          w - (Overwrite)
-#
-#                     MaxFileSize: Maximum file size of the log file before creating a new log file
-#                     (read as optional3 if Type = File)
-#                         Size is measured in bytes expressed in a 64-bit unsigned integer.
-#                         Maximum value is 4294967295 (4 GB). Leave blank for no limit.
-#                         NOTE: Does not work with dynamic filenames.
-#                         Example:  536870912 (512 MB)
-#
-
-# note that do to what I think is a bug in the Worldserver you must
-# copy all 3 of these log lines into your worldserver.conf file
-# or else it will not work.
-
-Appender.AuctionatorLog=2,5,0,auctionator.log,w
-Appender.AuctionatorConsole=1,4,0,"1 9 3 6 5 8"
-
-#  Logger config values: Given a logger "name"
-#    Logger.name
-#        Description: Defines 'What to log'
-#        Format:      LogLevel,AppenderList
-#
-#                     LogLevel
-#                         0 - (Disabled)
-#                         1 - (Fatal)
-#                         2 - (Error)
-#                         3 - (Warning)
-#                         4 - (Info)
-#                         5 - (Debug)
-#                         6 - (Trace)
-#
-#                     AppenderList: List of appenders linked to logger
-#                     (Using spaces as separator).
-#
-Logger.auctionator=4,AuctionatorLog AuctionatorConsole
+#   Appender.AuctionatorLog=2,5,0,auctionator.log,w
+#   Appender.AuctionatorConsole=1,4,0,"1 9 3 6 5 8"
+#   Logger.auctionator=4,AuctionatorLog AuctionatorConsole
+########################################
