@@ -201,14 +201,22 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
 
         if (!result)
         {
+            //
             // DatabaseWorkerPool::Query() returns a null result both when the query fails
-            // and when it matches zero rows (the first NextRow() is part of that check).
-            // The usual causes are: the mod_auctionator_* tables are missing or empty in
-            // the world database, or the world DB user has no SELECT grant on the
-            // characters schema (MySQL errors are printed by the sql logger).
-            logWarn("seller item query produced no rows for house "
-                + std::to_string(houseId)
-                + " (query failed or nothing matched; check mod_auctionator_itemclass_config in the world database and the sql log).");
+            // and when it matches zero rows (the first NextRow() is part of that check), so
+            // this one message has to name every likely cause - the seller would otherwise
+            // look healthy while listing nothing at all.
+            //
+            // The query runs on the *world* connection and joins the characters schema, so
+            // the world account needs SELECT there. AzerothCore's default grants do not
+            // include it, and a denied SELECT is only visible in the sql log.
+            //
+            logWarn("seller item query produced no rows for house " + std::to_string(houseId)
+                + ". Check, in this order: (1) the world DB user has SELECT on the characters schema, because the "
+                  "query joins " + characterDbName + ".mod_auctionator_market_price and " + characterDbName + ".item_instance "
+                  "through the world connection (a denied SELECT only shows in the sql log); (2) "
+                + worldDbName + ".mod_auctionator_itemclass_config exists and has rows; (3) "
+                  "item_template is populated for the configured class/subclass pairs.");
             return;
         }
 
@@ -274,6 +282,10 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
     {
         size_t cachedIndex = 0;
         uint64 weight = 1;
+        // Decided once here and reused by the pricing loop below: HasUsableMarketPrice() is
+        // a pure function of (item, maxAgeDays), so calling it twice per selected item only
+        // repeated the same comparison.
+        bool useMarketPrice = false;
     };
 
     std::vector<Candidate> candidates;
@@ -289,14 +301,16 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
             continue;
         }
 
+        bool const useMarketPrice = HasUsableMarketPrice(item, maxAgeDays);
+
         uint64 weight = 1;
-        if (preferMarketItems && HasUsableMarketPrice(item, maxAgeDays))
+        if (preferMarketItems && useMarketPrice)
         {
             // Volume bias, capped so one very liquid item cannot dominate every run.
             weight = 1 + std::min<uint64>(item.marketCount, 1000);
         }
 
-        candidates.push_back({ i, weight });
+        candidates.push_back({ i, weight, useMarketPrice });
     }
 
     logDebug("Seller selection houseId(" + std::to_string(houseId)
@@ -348,7 +362,8 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
 
     for (size_t pick = 0; pick < pickCount; ++pick)
     {
-        CachedItem const& item = cachedItems[candidates[ranked[pick].second].cachedIndex];
+        Candidate const& candidate = candidates[ranked[pick].second];
+        CachedItem const& item = cachedItems[candidate.cachedIndex];
         std::string const& itemName = item.name;
 
         //
@@ -372,7 +387,7 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
         // as-is, so market driven pricing stays market driven.
         //
         float const qualityMultiplier = Auctionator::GetQualityMultiplier(nator->config->sellerMultipliers, item.quality);
-        bool const useMarketPrice = HasUsableMarketPrice(item, maxAgeDays);
+        bool const useMarketPrice = candidate.useMarketPrice;
 
         uint32 unitPrice = useMarketPrice ? item.marketPrice : item.basePrice;
         if (unitPrice == 0) {

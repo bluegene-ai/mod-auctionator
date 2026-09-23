@@ -114,9 +114,10 @@ bid then equals the buyout, so a bid costs the same as buying it out).
 
 **Gold handling.** With the default owner (`bot`, i.e. the configured
 `Auctionator.CharacterGuid`) the sale money is mailed to the auctionator
-character and recycled by the mail script: the gold leaves the economy. Pass
-`me` or a character guid if you want the money to reach a real character
-instead.
+character and recycled by the mail script: the gold leaves the economy. The
+listing's *item* is recycled the same way if nobody buys it, so an unsold
+listing does not leave a dead mail behind either. Pass `me` or a character guid
+if you want the money to reach a real character instead.
 
 The item is created fresh from `item_template`, so any item can be listed,
 including bind-on-pickup, quest and unique items. The command warns you when an
@@ -456,9 +457,15 @@ These are invariants of the module, not side effects:
 1. **Gold from bot and GM listings is recycled by the system.** When a bot/GM
    listing sells, the core mails the proceeds to the auctionator character, and
    the mail script deletes that mail (and any items attached to it) before it is
-   sent. The gold leaves the economy. Passing an explicit `owner` to
-   `.auctionator add` is the only way to send the money to a character instead;
-   the command reply labels such a listing `GOLD SINK BYPASSED`.
+   sent. The gold leaves the economy. **Unsold listings are recycled too**: the
+   core's `SendAuctionExpiredMail()` attaches the unsold item to the expiry mail,
+   and because the character is never logged in - and the core only ever clears a
+   mailbox when its owner logs in - the script drops that item as well. Without
+   this every unsold listing leaked one dead mail plus its `item_instance` row for
+   good, and once the 100 mail cap was reached the core started silently dropping
+   the next expiry. Passing an explicit `owner` to `.auctionator add` is the only
+   way to send the money to a character instead; the command reply labels such a
+   listing `GOLD SINK BYPASSED`.
 2. **No deposit is ever paid out.** The module never charges a deposit, so
    mod-created auctions are created with `deposit = 0`; otherwise the core's
    "bid + deposit - cut" payout would mint gold.
@@ -508,3 +515,8 @@ These are invariants of the module, not side effects:
 4. The import is synchronous, so a very large CSV stalls the world thread while it
    is written. Keep `Auctionator.MarketData.ImportMaxRows` sane and prefer
    incremental exports.
+5. Recycled mail is destroyed, not returned: an unsold listing's item is deleted
+   together with its expiry mail (see "Economy and safety guarantees" 1), so the
+   module is an item sink as well as a gold sink. The bot never reclaims its own
+   stock - if you want unsold items back, use a real `owner` on `.auctionator add`
+   (that mail is not recycled).

@@ -161,6 +161,24 @@ bool Auctionator::CreateAuction(AuctionatorItem newItem, CharacterDatabaseTransa
 
     uint32 const houseId = newItem.houseId;
 
+    //
+    // Resolve the AuctionHouse.dbc entry NOW, before anything is written.
+    //
+    // It is the last thing that can fail, and it used to be resolved after
+    // item->SaveToDB(trans), where a failure had to delete the Item object while its INSERT
+    // row was already queued on the transaction. With a caller supplied transaction (the
+    // seller batches a whole run into one) that row was then committed by the caller, so
+    // every such failure left behind an orphan item_instance row with no auction, no mail
+    // and no owner. Resolving it here means every failure path below runs before the first
+    // write, so the transaction can never be polluted.
+    //
+    AuctionHouseEntry const* auctionHouseEntry = sAuctionMgr->GetAuctionHouseEntryFromHouse((AuctionHouseId)houseId);
+    if (!auctionHouseEntry)
+    {
+        logError("Auctionator CreateAuction failed: unable to resolve auction house entry for houseId " + std::to_string(houseId));
+        return false;
+    }
+
     logDebug("Creating Auction for item: " + std::to_string(newItem.itemId)
         + " owned by " + std::to_string(ownerGuid.GetCounter()));
 
@@ -197,10 +215,7 @@ bool Auctionator::CreateAuction(AuctionatorItem newItem, CharacterDatabaseTransa
     // on the item instance and not on the auction item.
     item->SetCount(newItem.stackSize > 1 ? newItem.stackSize : 1);
 
-    // The item GUID comes from the generator during creation, so this is checkable (and
-    // has to be checked) before anything is written: with a caller supplied transaction,
-    // a stray item_instance INSERT for an item we then delete would be committed by the
-    // caller instead of being dropped together with our own transaction.
+    // The item GUID comes from the generator during creation.
     if (item->GetGUID().IsEmpty())
     {
         logError("Auctionator CreateAuction failed: item GUID was invalid for item " + std::to_string(newItem.itemId));
@@ -231,15 +246,7 @@ bool Auctionator::CreateAuction(AuctionatorItem newItem, CharacterDatabaseTransa
     // "bid + deposit - cut" to the owner, so a non-zero deposit would mint gold.
     auctionEntry->deposit = 0;
     auctionEntry->expire_time = (time_t)newItem.time + time(nullptr);
-    auctionEntry->auctionHouseEntry = sAuctionMgr->GetAuctionHouseEntryFromHouse((AuctionHouseId)houseId);
-
-    if (!auctionEntry->auctionHouseEntry)
-    {
-        logError("Auctionator CreateAuction failed: unable to resolve auction house entry for houseId " + std::to_string(houseId));
-        delete auctionEntry;
-        delete item;
-        return false;
-    }
+    auctionEntry->auctionHouseEntry = auctionHouseEntry;
 
     item->SaveToDB(trans);
 
@@ -352,7 +359,22 @@ void Auctionator::Initialize()
         return;
     }
 
+    //
+    // The account name handed to the dummy session must be the real one. The core builds
+    // its own sessions with the authenticated account name (WorldSocket.cpp) and only ever
+    // stores this value, but a made up name makes every log line and any future check that
+    // reads it wrong, so it is read from the login database instead of hardcoded.
+    //
     std::string accountName = "Auctionator";
+    if (QueryResult accountResult = LoginDatabase.Query("SELECT username FROM account WHERE id = {}", config->characterId))
+    {
+        accountName = accountResult->Fetch()[0].Get<std::string>();
+    }
+    else
+    {
+        logWarn("no `account` row with id " + std::to_string(config->characterId)
+            + "; the dummy session is created with a placeholder account name.");
+    }
 
     HordeAh = sAuctionMgr->GetAuctionsMapByHouseId(AuctionHouseId::Horde);
     HordeAhEntry = sAuctionHouseStore.LookupEntry((uint32)AuctionHouseId::Horde);

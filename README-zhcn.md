@@ -73,7 +73,7 @@ ItemID 可以在数据库表 `item_template` 中查找。
 
 **起拍价。** 起拍价为 0 的上架可以被 1 铜币拿走：核心只拒绝低于 `auction->startbid` 的出价，而 1 铜币永远不低于 0。因此本命令用与自动卖家完全相同的规则从买断价推导起拍价——`买断价 * (1 - Auctionator.Seller.BidStartModifier)`，且至少为 1——在默认 `0.3` 下，10000 铜币的上架起拍价为 7000。如果希望 GM 上架只能买断（起拍价等于买断价，出价与买断同价），把 `Auctionator.Seller.BidStartModifier` 设为 `0`。
 
-**金币处理。** 使用默认 owner（`bot`，即配置的 `Auctionator.CharacterGuid`）时，销售所得会邮寄给拍卖机器人角色，并由邮件脚本回收：金币离开经济系统。传入 `me` 或角色 guid 可以让金币到达真实角色。
+**金币处理。** 使用默认 owner（`bot`，即配置的 `Auctionator.CharacterGuid`）时，销售所得会邮寄给拍卖机器人角色，并由邮件脚本回收：金币离开经济系统。如果无人购买，该上架的**物品**同样会被回收，因此流拍也不会留下死邮件。传入 `me` 或角色 guid 可以让金币到达真实角色。
 
 物品会从 `item_template` 全新创建，因此任何物品都可以上架，包括拾取绑定、任务和唯一物品。当物品是任务/唯一物品时，命令会警告你，因为这些检查被绕过了。
 
@@ -332,7 +332,7 @@ node index.js mypricedata.csv --source=tsm | mysql -u <dbuser> -p <character_dat
 
 这些是模块的不变量，而不是副作用：
 
-1. **来自机器人和 GM 上架的金币会被系统回收。** 当机器人/GM 的上架售出时，核心会将收益邮寄给拍卖机器人角色，邮件脚本会在发送前删除该邮件（以及任何附件）。金币离开经济系统。向 `.auctionator add` 传入显式 `owner` 是将金币发送给角色的唯一方式；命令回复会将此类上架标记为 `GOLD SINK BYPASSED`。
+1. **来自机器人和 GM 上架的金币会被系统回收。** 当机器人/GM 的上架售出时，核心会将收益邮寄给拍卖机器人角色，邮件脚本会在发送前删除该邮件（以及任何附件）。金币离开经济系统。**流拍同样会被回收**：核心的 `SendAuctionExpiredMail()` 会把未售出的物品附在过期邮件上，而该角色永不登录、核心只在角色登录时清理邮箱，所以脚本把过期邮件里的物品一并删除——否则每个流拍都会永久留下一个死邮件和一条 `item_instance` 记录，邮箱达到 100 封上限后核心还会开始静默丢弃过期邮件。向 `.auctionator add` 传入显式 `owner` 是将金币发送给角色的唯一方式；命令回复会将此类上架标记为 `GOLD SINK BYPASSED`。
 2. **永远不会支付保管费。** 模块从不收取保管费，因此模块创建的拍卖以 `deposit = 0` 创建；否则核心的 "bid + deposit - cut" 支付会凭空造币。
 3. **玩家拍卖永远不会被破坏。**
    * `.auctionator expireall <house>` 只使拍卖机器人角色拥有的拍卖过期；玩家拍卖不受影响，除非传入 `all`。
@@ -348,3 +348,4 @@ node index.js mypricedata.csv --source=tsm | mysql -u <dbuser> -p <character_dat
 2. ~~无法控制堆叠大小，硬编码为 20。~~ 堆叠大小按类别/子类别数据驱动（`stack_count`，见“物品选择”），GM 上架接受显式 `stack` 参数。
 3. 物品选择由 `mod_auctionator_itemclass_config` 和 `mod_auctionator_disabled_items` 驱动；目前仍没有游戏内编辑器（编辑表并等待下一个卖家周期）。
 4. 导入是同步的，因此非常大的 CSV 在写入时会阻塞 world 线程。保持 `Auctionator.MarketData.ImportMaxRows` 合理，并优先使用增量导出。
+5. 被回收的邮件是**销毁**而非退回：流拍上架的物品会随其过期邮件一起删除（见“经济与安全保证”第 1 条），因此模块既是金币水池也是物品水池。机器人不会收回自己的库存——若希望流拍物品找回，请在 `.auctionator add` 上使用真实 `owner`（那封邮件不会被回收）。

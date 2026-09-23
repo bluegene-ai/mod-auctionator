@@ -35,8 +35,13 @@ Auctionator.CharacterId = 2
 #    Auctionator.CharacterGuid
 #        The character GUID that owns the bot's listings and receives their auction
 #        mail. Use a dedicated, never played character: the mail script deletes that
-#        character's auction mail, which is what turns bot sales into a gold sink
-#        (while the character is online nothing is recycled, to protect a real player).
+#        character's auction mail, which is what turns bot sales into a gold sink and
+#        keeps unsold listings from piling up. Both kinds of auction mail are
+#        recycled - the sale proceeds, and the item of a listing nobody bought
+#        (the core attaches it to the expiry mail, and the core only clears a mailbox
+#        when its owner logs in, so an offline character would accumulate dead mail
+#        until the 100 mail cap made the core drop it silently).
+#        While the character is online nothing is recycled, to protect a real player.
 #        A GUID that is not in the characters database is reported at startup, because
 #        the core then drops the sale mail silently (no gold, items lost).
 #

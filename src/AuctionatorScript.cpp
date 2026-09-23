@@ -159,6 +159,20 @@ public:
         }
 
         //
+        // Every MAIL_AUCTION message addressed to the configured character is recycled, not
+        // just the "sold" one:
+        //
+        //   * AUCTION_SUCCESSFUL carries the sale money (the gold sink), and
+        //   * AUCTION_EXPIRED carries the *item* of a listing nobody bought
+        //     (AuctionHouseMgr::SendAuctionExpiredMail() attaches it with AddItem()).
+        //
+        // The expired one has to be recycled as well, because the configured character is
+        // never logged in and the core only ever clears a mailbox when the owner logs in.
+        // Without this the module leaked one dead mail (plus its item_instance row) per
+        // unsold listing, forever: the mail table grew without bound, and once the 100 mail
+        // cap was reached the core silently dropped the next expiry - destroying the item
+        // anyway, but invisibly.
+        //
         // Hard invariant: never destroy a real player's mail.
         //
         // If the receiver of this auction mail is online, then a human (or a bot system)
@@ -176,6 +190,8 @@ public:
             return;
         }
 
+        // deleteMailItemsFromDB also drops the expired listing's item (Item::SaveToDB()'s
+        // ITEM_REMOVED branch), and sendMail = false drops the mail row itself.
         deleteMailItemsFromDB = true;
         sendMail = false;
     }
