@@ -350,6 +350,7 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
     uint32 created = 0;
 
     float const bidStartModifier = std::clamp(nator->config->sellerConfig.bidStartModifier, 0.0f, 1.0f);
+    bool const bidOnly = nator->config->sellerConfig.bidOnly != 0;
     float const minPriceModifier = nator->config->sellerConfig.minPriceModifier;
     float const maxPriceModifier = nator->config->sellerConfig.maxPriceModifier;
     uint32 const defaultPrice = nator->config->sellerConfig.defaultPrice;
@@ -449,10 +450,25 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
         newItem.itemId = item.entry;
         newItem.houseId = houseId;
 
-        uint32 const buyoutValue = ClampPrice(static_cast<long long>(static_cast<uint64>(unitPrice) * static_cast<uint64>(stackSize)));
-        uint32 const bidValue = ClampPrice(static_cast<long long>(static_cast<uint64>(bidPrice) * static_cast<uint64>(stackSize)));
-        newItem.buyout = buyoutValue;
-        newItem.bid = std::min<uint32>(bidValue, newItem.buyout);
+        uint32 const stackTotal = ClampPrice(static_cast<long long>(static_cast<uint64>(unitPrice) * static_cast<uint64>(stackSize)));
+
+        if (bidOnly)
+        {
+            //
+            // Pure auction: no buyout at all, so the entry can only be won by bidding. The
+            // start bid is the full stack price - bidStartModifier is deliberately not
+            // applied, because without a buyout there is nothing to discount from and a
+            // random discount would only lower the reserve price.
+            //
+            newItem.buyout = 0;
+            newItem.bid = stackTotal;
+        }
+        else
+        {
+            uint32 const bidValue = ClampPrice(static_cast<long long>(static_cast<uint64>(bidPrice) * static_cast<uint64>(stackSize)));
+            newItem.buyout = stackTotal;
+            newItem.bid = std::min<uint32>(bidValue, newItem.buyout);
+        }
         newItem.time = 60 * 60 * 12;
         newItem.stackSize = stackSize;
 

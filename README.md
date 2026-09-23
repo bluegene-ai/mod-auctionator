@@ -112,6 +112,14 @@ shipped `0.3` a 10000 copper listing starts bidding at 7000. Set
 `Auctionator.Seller.BidStartModifier = 0` if GM listings should be buyout-only (the start
 bid then equals the buyout, so a bid costs the same as buying it out).
 
+**Bid-only listings.** With `Auctionator.Seller.BidOnly = 1` the module creates no buyout at
+all (the automatic seller and both GM commands): the price above becomes the *start bid*
+(`<price> * stack` for `.auctionator add`) and the entry can only be won by bidding. The
+core treats buyout 0 as "no buyout", which is exactly what a player listing with an empty
+buyout sends, so no core change is involved. `BidStartModifier` is ignored in this mode.
+A bid-only entry that nobody bids on still expires and its item is recycled like any other
+unsold listing.
+
 **Gold handling.** With the default owner (`bot`, i.e. the configured
 `Auctionator.CharacterGuid`) the sale money is mailed to the auctionator
 character and recycled by the mail script: the gold leaves the economy. The
@@ -418,6 +426,10 @@ sell price cannot make the bot list below what a vendor pays (which a player cou
 otherwise buy up and vendor at a profit). The starting bid is a random value between
 `(1 - BidStartModifier) x buyout` and the buyout, and is never 0 - a start bid of 0 would
 let a player take the auction for 1 copper.
+
+With `Auctionator.Seller.BidOnly = 1` the buyout is dropped entirely instead: the price
+computed above becomes the start bid and the listing can only be won by bidding (see the
+"Bid-only listings" note under the GM commands).
 
 ## Item selection
 

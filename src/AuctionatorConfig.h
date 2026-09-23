@@ -48,6 +48,16 @@ struct AuctionatorSellerConfig
     // conf/mod_auctionator.conf.dist.
     float bidStartModifier = 0.3f;
 
+    // 1 = every listing this module creates is bid-only: no buyout at all, and the computed
+    // price becomes the start bid. The core reads buyout 0 as "no buyout"
+    // (HandleAuctionPlaceBid() checks `price < auction->buyout || auction->buyout == 0`), and
+    // CreateAuction() only refuses a listing when bid and buyout are *both* 0, so this needs
+    // no core change. bidStartModifier is ignored in this mode: there is no buyout to discount
+    // from, and a random discount would only lower the reserve price.
+    // 0 = normal behaviour. Keep in sync with the fallback in Auctionator::InitializeConfig()
+    // and with conf/mod_auctionator.conf.dist.
+    uint32 bidOnly = 0;
+
     // Bias the item selection towards entries that have fresh market data,
     // weighted by traded volume.
     uint32 preferMarketItems = 1;

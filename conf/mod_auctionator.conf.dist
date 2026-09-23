@@ -164,6 +164,31 @@ Auctionator.Seller.RandomizeStackSize = 1
 Auctionator.Seller.BidStartModifier = .3
 
 ########################################
+# BID-ONLY LISTINGS (NO BUYOUT)
+#
+# 1 - every listing this module creates is bid-only: the buyout is left at 0, so the
+#     entry can only be won by bidding, and the price computed by the pricing rules
+#     above becomes the *start bid* (multiplied by the stack, as the buyout was).
+#     This applies to the automatic seller and to the GM commands
+#     (".auctionator add" / "addlist"); for those the "<price>" argument is still a
+#     unit price, it simply becomes the start bid instead of the buyout.
+# 0 - normal behaviour (buyout = price, start bid derived from it).
+#     Default: 0
+#
+# Auctionator.Seller.BidStartModifier is ignored while this is 1: there is no buyout to
+# discount from, and a random discount would only lower the reserve price.
+#
+# Notes:
+#   * The core fully supports buyout 0 (it is what a player listing with an empty
+#     buyout sends), so nothing else has to change.
+#   * An entry with no bids still expires and its item is recycled (deleted), exactly
+#     like an unsold buyout listing.
+#   * A single bid wins at the start-bid price, so keep the price floor in mind
+#     (Auctionator.Seller.MinPriceModifier) when running in this mode.
+########################################
+Auctionator.Seller.BidOnly = 0
+
+########################################
 # MARKET DRIVEN PRICING
 #
 # Prices come from mod_auctionator_market_price.average_price when the imported

@@ -495,6 +495,9 @@ void Auctionator::InitializeConfig(ConfigMgr* configMgr)
         0.0f,
         1.0f
     );
+    // Pure-auction mode: no buyout on any listing created by this module (the automatic
+    // seller and the GM add/addlist commands). See AuctionatorSellerConfig::bidOnly.
+    config->sellerConfig.bidOnly = configMgr->GetOption<uint32>("Auctionator.Seller.BidOnly", 0);
 
     config->marketDataMaxAgeDays = configMgr->GetOption<uint32>("Auctionator.MarketData.MaxAgeDays", 14);
     config->marketDataImportFile = configMgr->GetOption<std::string>("Auctionator.MarketData.ImportFile", "");

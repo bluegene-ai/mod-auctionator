@@ -73,6 +73,8 @@ ItemID 可以在数据库表 `item_template` 中查找。
 
 **起拍价。** 起拍价为 0 的上架可以被 1 铜币拿走：核心只拒绝低于 `auction->startbid` 的出价，而 1 铜币永远不低于 0。因此本命令用与自动卖家完全相同的规则从买断价推导起拍价——`买断价 * (1 - Auctionator.Seller.BidStartModifier)`，且至少为 1——在默认 `0.3` 下，10000 铜币的上架起拍价为 7000。如果希望 GM 上架只能买断（起拍价等于买断价，出价与买断同价），把 `Auctionator.Seller.BidStartModifier` 设为 `0`。
 
+**纯拍卖（不设一口价）。** 把 `Auctionator.Seller.BidOnly` 设为 `1` 后，模块创建的条目完全不设一口价（自动卖家与两条 GM 命令都生效）：上面的价格直接成为**起拍价**（`.auctionator add` 为 `<price> * stack`），条目只能靠竞标成交。核心把 buyout 0 当作"没有一口价"——这正是玩家留空一口价上架时发送的值——所以不涉及任何核心改动。此模式下 `BidStartModifier` 被忽略。无人出价的纯拍卖条目照常过期，物品与其它流拍一样被回收删除。
+
 **金币处理。** 使用默认 owner（`bot`，即配置的 `Auctionator.CharacterGuid`）时，销售所得会邮寄给拍卖机器人角色，并由邮件脚本回收：金币离开经济系统。如果无人购买，该上架的**物品**同样会被回收，因此流拍也不会留下死邮件。传入 `me` 或角色 guid 可以让金币到达真实角色。
 
 物品会从 `item_template` 全新创建，因此任何物品都可以上架，包括拾取绑定、任务和唯一物品。当物品是任务/唯一物品时，命令会警告你，因为这些检查被绕过了。
@@ -310,6 +312,8 @@ node index.js mypricedata.csv --source=tsm | mysql -u <dbuser> -p <character_dat
 | `Auctionator.Seller.DefaultPrice`（默认 100 金币） | 无市场数据**且**无商人价格 | 按品质的 `Multipliers.Seller.*` |
 
 结果会被限制在 `[SellPrice x MinPriceModifier, marketPrice x MaxPriceModifier]` 范围内（上限仅在价格来自市场时适用），乘以堆叠数量并封顶于 `MAX_MONEY_AMOUNT`。上限在**地板价之前**应用，因此地板价始终生效：即使导入的市场均价远低于商人收购价，机器人也不会以低于商人收购价的价格上架（否则玩家可以买入再卖给商人套利）。起拍价是 `(1 - BidStartModifier) x 买断价` 到买断价之间的随机值，且永远不为 0——起拍价为 0 会让玩家用 1 铜币拿走该拍卖。
+
+当 `Auctionator.Seller.BidOnly = 1` 时则完全去掉一口价：上面算出的价格直接作为**起拍价**，条目只能靠竞标成交（见 GM 命令一节里的"纯拍卖"说明）。
 
 ## 物品选择
 

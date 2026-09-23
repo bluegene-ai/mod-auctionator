@@ -307,25 +307,41 @@ class AuctionatorCommands : public CommandScript
             if (report && totalPrice > MAX_MONEY_AMOUNT)
             {
                 handler->SendSysMessage("[Auctionator] add: " + proto->Name1 + " [" + std::to_string(itemId)
-                    + "] stack total exceeds the maximum money amount, capping the buyout at "
+                    + "] stack total exceeds the maximum money amount, capping the listing price at "
                     + std::to_string(MAX_MONEY_AMOUNT) + " copper.");
             }
+
+            uint32 const cappedTotal = static_cast<uint32>(std::min<uint64>(totalPrice, MAX_MONEY_AMOUNT));
 
             AuctionatorItem newItem;
             newItem.houseId = auctionHouseId;
             newItem.itemId = itemId;
-            newItem.buyout = static_cast<uint32>(std::min<uint64>(totalPrice, MAX_MONEY_AMOUNT));
 
-            //
-            // A start bid of 0 means "any bid wins" to the core: HandleAuctionPlaceBid only
-            // rejects a bid below auction->startbid, so a 0 would let a player take the stack
-            // (including a 500000 copper epic) for 1 copper when the auction expires. Use the
-            // same rule as the automatic seller: buyout * (1 - BidStartModifier), never below 1.
-            //
-            float const bidStartModifier = std::clamp(auctionator->config->sellerConfig.bidStartModifier, 0.0f, 1.0f);
-            uint64 const startBid = static_cast<uint64>(std::llround(
-                static_cast<double>(newItem.buyout) * (1.0 - static_cast<double>(bidStartModifier))));
-            newItem.bid = static_cast<uint32>(std::min<uint64>(std::max<uint64>(1, startBid), newItem.buyout));
+            if (auctionator->config->sellerConfig.bidOnly)
+            {
+                //
+                // Pure auction (Auctionator.Seller.BidOnly = 1): no buyout, so the whole
+                // price becomes the start bid. The GM still passes a *unit* price; it is
+                // multiplied by the stack exactly like the buyout would have been.
+                //
+                newItem.buyout = 0;
+                newItem.bid = cappedTotal;
+            }
+            else
+            {
+                newItem.buyout = cappedTotal;
+
+                //
+                // A start bid of 0 means "any bid wins" to the core: HandleAuctionPlaceBid only
+                // rejects a bid below auction->startbid, so a 0 would let a player take the stack
+                // (including a 500000 copper epic) for 1 copper when the auction expires. Use the
+                // same rule as the automatic seller: buyout * (1 - BidStartModifier), never below 1.
+                //
+                float const bidStartModifier = std::clamp(auctionator->config->sellerConfig.bidStartModifier, 0.0f, 1.0f);
+                uint64 const startBid = static_cast<uint64>(std::llround(
+                    static_cast<double>(newItem.buyout) * (1.0 - static_cast<double>(bidStartModifier))));
+                newItem.bid = static_cast<uint32>(std::min<uint64>(std::max<uint64>(1, startBid), newItem.buyout));
+            }
 
             newItem.stackSize = finalStack;
             newItem.time = hours * 60 * 60;
@@ -338,7 +354,9 @@ class AuctionatorCommands : public CommandScript
                 handler->SendSysMessage("[Auctionator] add: listed " + proto->Name1 + " [" + std::to_string(itemId) + "]"
                     + " x" + std::to_string(finalStack)
                     + " in house " + std::to_string(auctionHouseId)
-                    + " at " + std::to_string(newItem.buyout) + " copper buyout"
+                    + (newItem.buyout != 0
+                        ? " at " + std::to_string(newItem.buyout) + " copper buyout"
+                        : std::string(" as a bid-only listing (no buyout)"))
                     + ", start bid " + std::to_string(newItem.bid) + " copper"
                     + " for " + std::to_string(hours) + "h"
                     + " | owner: " + DescribeOwner(ownerGuid) + ".");
@@ -799,6 +817,8 @@ add <house> <item[,item...]> <price> [stack] [hours] [owner]
              auction nobody can see)
      price: unit price in copper (buyout = price * stack)
      start bid: buyout * (1 - Auctionator.Seller.BidStartModifier), at least 1
+            (with Auctionator.Seller.BidOnly = 1 there is no buyout at all: the
+             listing can only be won by bidding and "price * stack" is the start bid)
      stack: default 1, capped by the item's max stack
      hours: default 48, range 1..720
      owner: "bot" (default) recycles the sale money, "me" or a character guid
