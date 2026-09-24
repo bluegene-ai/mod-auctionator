@@ -163,6 +163,7 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
                 AND (aicconf.bonding = 0 OR it.bonding >= aicconf.bonding)
         )" + verifiedBuildFilter + R"(
             LEFT JOIN {}.mod_auctionator_disabled_items dis ON it.entry = dis.item
+            LEFT JOIN {}.mod_auctionator_quality_config qc ON qc.quality = it.quality
             LEFT JOIN (
                 SELECT mp1.entry
                     , mp1.average_price
@@ -176,6 +177,9 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
                 ) mp2 ON mp1.entry = mp2.entry AND mp1.scan_datetime = mp2.max_scan
             ) mp ON it.entry = mp.entry
         WHERE dis.item IS NULL
+            -- Quality gate: a quality with no row (or with enabled = 1) may be listed, so an
+            -- empty table keeps the old behaviour and the switch is per quality, not a floor.
+            AND (qc.quality IS NULL OR qc.enabled = 1)
     )";
 
     //
@@ -197,7 +201,7 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
         PoolCacheMs = 0;
 
         QueryResult result = WorldDatabase.Query(cacheQuery,
-            worldDbName, worldDbName, worldDbName, characterDbName, characterDbName);
+            worldDbName, worldDbName, worldDbName, worldDbName, characterDbName, characterDbName);
 
         if (!result)
         {
@@ -216,7 +220,8 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
                   "query joins " + characterDbName + ".mod_auctionator_market_price and " + characterDbName + ".item_instance "
                   "through the world connection (a denied SELECT only shows in the sql log); (2) "
                 + worldDbName + ".mod_auctionator_itemclass_config exists and has rows; (3) "
-                  "item_template is populated for the configured class/subclass pairs.");
+                  "item_template is populated for the configured class/subclass pairs; (4) "
+                + worldDbName + ".mod_auctionator_quality_config does not have every quality disabled.");
             return;
         }
 

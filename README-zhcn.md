@@ -30,7 +30,7 @@
 2. 带着模块构建核心（`-DMODULES=static`），然后部署新的 `worldserver` 二进制文件。
 3. 确保**服务器的 `SourceDirectory` 指向包含 `modules/mod-auctionator/data/sql/` 的源码树**（留空则使用编译时的源码路径）。AzerothCore 更新器会从 `<SourceDirectory>/modules/<module>/data/sql/` 应用模块 SQL；如果该路径不可达，模块的表就永远不会创建，卖家找不到候选物品，市场导入也会失败。
    如果你更愿意手动执行，请针对对应的数据库运行以下 SQL：
-   * world 数据库：`data/sql/db-world/base/2023-09-18.sql` 和 `data/sql/db-world/base/mod_auctionator_gm_list.sql`
+   * world 数据库：`data/sql/db-world/base/2023-09-18.sql`、`data/sql/db-world/base/mod_auctionator_gm_list.sql` 和 `data/sql/db-world/base/mod_auctionator_quality_config.sql`
    * characters 数据库，按以下顺序：`data/sql/db-characters/updates/2023_11_12_00_marketprice.sql`、`data/sql/db-characters/updates/2026_09_20_00_market_price_history.sql`、`data/sql/db-characters/updates/2026_01_29_00_improve_performance.sql`
    在两个数据库中都用 `SHOW TABLES LIKE 'mod_auctionator%';` 验证。
 4. **创建模块配置文件。** 构建会附带 `modules/mod-auctionator/conf/mod_auctionator.conf.dist`；服务器只读取 `configs/modules/mod_auctionator.conf`（没有 `.dist`），而且 Windows 构建不会自动为你复制：
@@ -166,6 +166,20 @@ ItemID 可以在数据库表 `item_template` 中查找。两种写法**不能混
 
 ```
 .auctionator bidonown 1
+```
+
+### auctionator buyout <0|1>
+
+模块新建条目形态的快速开关，也是管理页上「买断模式」按钮背后的命令：
+
+* `1` — 条目重新带上买断价（`Auctionator.Seller.BidOnly = 0`），起拍价照旧由 `Auctionator.Seller.BidStartModifier` 推导。
+* `0` — **完全不设一口价**（`Auctionator.Seller.BidOnly = 1`）：卖家算出来的价格直接成为**起拍价**，条目只能靠竞拍成交；无人出价则照常过期回收。
+
+一次作用于整个区：自动卖家、位置式 `.auctionator add`，以及所有没有显式写 `mode` 的 `mod_auctionator_gm_list` 行；卖家每创建一条挂单都会重读该开关，所以**下一轮就生效，不必重启**。这条命令只改运行中的配置；面板上的开关会同时把 `Auctionator.Seller.BidOnly` 写进配置文件，使选择跨重启保持。
+
+```
+.auctionator buyout 0    # 只保留竞价
+.auctionator buyout 1    # 恢复买断模式
 ```
 
 ### auctionator disable <target>
@@ -325,12 +339,35 @@ node index.js mypricedata.csv --source=tsm | mysql -u <dbuser> -p <character_dat
 
 `minimum_buyout` 和 `minimum_bid` 不使用；`item_count`（成交量）被卖家的市场权重使用。
 
+### 方案 C - 直接采样本区拍卖行（完全不需要导出）
+
+```
+.auctionator marketscan
+```
+
+或者让它自己跑：
+
+```
+Auctionator.MarketData.ScanIntervalMinutes = 60
+Auctionator.MarketData.ScanExcludeSelf = 1
+```
+
+这条路径把**本区**拍卖行的当前挂单（`characters.auctionhouse` + `item_instance`）用**一条 SQL** 聚合成市场价——不需要 CSV、不需要外部工具、不需要 cron。每个物品写入：按堆叠量加权的**单价**（拍卖行存的是整组价，所以要除以堆叠数）、最低单价买断/起拍价、以及参与采样的挂单数，`source = 'ah-scan'`。
+
+* 有买断价的挂单**优先**；只有当某物品的挂单**全都没有**买断价时才退回用起拍价。这样跑纯竞拍（`BidOnly = 1`）的区也有价格，而有买断价的物品不会被起拍价拉低。
+* `ScanExcludeSelf = 1`（默认）把**机器人自己角色的挂单**排除在样本之外。否则"市场价"只是机器人自己报价的镜像；而且由于按市场价定价时会**忽略品质倍率**，机器人自己的库存会把你上一次的价格锁死 `MaxAgeDays` 天。因此在一个拍卖行里只有机器人挂单的区，采样会写入 0 行——把该项设为 `0` 即可连带采样，命令也会明确告诉你"0 行是因为全被排除了"。
+* 命令会回报写入行数、采样挂单数、其中多少属于机器人自己，所以空结果是有解释的，而不是让人猜。
+* `ScanIntervalMinutes = 0`（默认）表示"只手动"：命令和面板按钮照常可用，定时器只是不触发。首次定时采样在启动约一分钟后执行。
+
+因为每次运行都会给每个物品新增一行，间隔较小时请定期 `marketprune` 清理历史。
+
 ### 运维
 
 ```
 .auctionator market              # 行数、不同物品数、有多少物品有可用扫描
 .auctionator marketimport        # 立即导入 Auctionator.MarketData.ImportFile
 .auctionator marketimport force  # 即使文件未更改也导入
+.auctionator marketscan          # 立即采样本区拍卖行并生成市场价
 .auctionator marketprune 30      # 删除超过 30 天的扫描
 ```
 
@@ -364,14 +401,18 @@ node index.js mypricedata.csv --source=tsm | mysql -u <dbuser> -p <character_dat
 |---|---|---|
 | `mod_auctionator_itemclass_config` | `class`、`subclass`、`bonding`、`max_count`、`stack_count` | 每个物品类别/子类别一行 |
 | `mod_auctionator_disabled_items` | `item` | `item_template.entry` 的扁平黑名单 |
+| `mod_auctionator_quality_config` | `quality`、`enabled` | 每个 `item_template.quality` 一行（0 粗糙 .. 7 传家宝） |
 
 * `bonding` - 该行匹配所需的最低 `item_template.bonding`；`0` 表示“无额外约束”。`bonding = 1`（拾取绑定）的物品总是被排除。随附的行只使用 0 和 1，因此该列目前在该类别中充当“允许/不允许未绑定物品”的标志。
 * `max_count` - 每个物品条目的配额：当卖家在该拍卖行已有 `max_count` 个拍卖时跳过该物品。**`max_count = 0` 表示“永不上架此类别/子类别”**（它是配额，不是“无限”）。
 * `stack_count` - 一个上架中包含多少物品（武器/护甲 `1`，贸易商品和药水 `20`，药剂 `10`，……）。它会被物品自身的最大堆叠数限制；值为 `0` 的行回退到该最大堆叠数（该列是 `NOT NULL DEFAULT 1`，因此不会出现 `NULL`）。当 `Auctionator.Seller.RandomizeStackSize = 1` 时，上架使用 1 到 `stack_count` 之间的随机值，而不是完整值。
+* `enabled` - 按品质的开关。`0` 表示该品质**永不**被自动上架；`1` 或者**根本没有这一行**都表示允许。选“无行即允许”是为了让空表（以及还没执行过本次 SQL 更新的 world 库）保持原有的上架行为，因此这个开关只会**减少**GM 主动关掉的品质。它与类别白名单相互独立：一件物品必须同时命中类别行、且其品质没有被关掉，才会被上架。
+
+`mod_auctionator_itemclass_config` 是**白名单**而不是黑名单：卖家的候选查询对它做 `INNER JOIN`，所以没有行的「类别/子类别」永远不会被上架。这也是为什么“启用一类”要靠**建行**（面板的「应用到整类」会按 `mod_auctionator_item_class` 补齐），而“停用一类”是把 `max_count` 设为 0。
 
 `item_template.VerifiedBuild = 1` 的行默认**不会**被过滤掉：在大多数 world 数据库中，该标志表示“未经内容团队验证”，跳过这些行会移除很大一部分可用目录（在标准 WotLK world 数据库中约 30%）。如果你的数据对此有不同含义，请设置 `Auctionator.Seller.ExcludeUnverifiedItems = 1`。
 
-两张表在每个卖家周期都会重新读取，因此编辑无需重启即可生效。
+三张表在每个卖家周期都会重新读取，因此编辑无需重启即可生效。
 
 ## 经济与安全保证
 
@@ -391,6 +432,6 @@ node index.js mypricedata.csv --source=tsm | mysql -u <dbuser> -p <character_dat
 
 1. ~~堆叠表现异常，尤其是附魔棒之类的物品。~~ 已修复。上架的堆叠数来自 `mod_auctionator_itemclass_config.stack_count`（受物品自身最大堆叠数限制）；当 `Auctionator.Seller.RandomizeStackSize = 1` 时，它是 1 到该大小之间的随机值。
 2. ~~无法控制堆叠大小，硬编码为 20。~~ 堆叠大小按类别/子类别数据驱动（`stack_count`，见“物品选择”），GM 上架接受显式 `stack` 参数。
-3. 物品选择由 `mod_auctionator_itemclass_config` 和 `mod_auctionator_disabled_items` 驱动；目前仍没有游戏内编辑器（编辑表并等待下一个卖家周期）。
+3. 物品选择由 `mod_auctionator_itemclass_config`（类别白名单）、`mod_auctionator_quality_config`（品质白名单）和 `mod_auctionator_disabled_items`（黑名单）驱动；目前仍没有游戏内编辑器，但管理面板可以在线编辑这三张表并即时生效。
 4. 导入是同步的，因此非常大的 CSV 在写入时会阻塞 world 线程。保持 `Auctionator.MarketData.ImportMaxRows` 合理，并优先使用增量导出。
 5. 被回收的邮件是**销毁**而非退回：流拍上架的物品会随其过期邮件一起删除（见“经济与安全保证”第 1 条），因此模块既是金币水池也是物品水池。机器人不会收回自己的库存——若希望流拍物品找回，请在 `.auctionator add` 上使用真实 `owner`（那封邮件不会被回收）。

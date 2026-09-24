@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +18,16 @@ namespace
     uint32 const ImportBatchRows = 500;
 
     std::string const MarketTableName = "mod_auctionator_market_price";
+
+    // `source` value of a row this module produced by sampling the realm's own auction house,
+    // so those rows can be told apart from an imported CSV feed (and pruned separately).
+    std::string const ScanSource = "ah-scan";
+
+    // Auction house prices are stored for the whole stack in columns that are unsigned, so a
+    // single unit price can exceed the signed INT the market table uses. Clamping in SQL keeps
+    // one absurd listing from making the whole statement fail with "Out of range value".
+    // Same limit as the CSV importer (MaxImportValue below).
+    uint32 const MaxScanValue = 2147483647u;
 
     //
     // Identity of the last imported file. The periodic import runs every
@@ -467,6 +478,152 @@ uint32 AuctionatorMarketData::PruneOlderThan(uint32 days)
 
     logInfo("market prune: removed " + std::to_string(rowCount) + " row(s) older than " + std::to_string(days) + " day(s).");
     return static_cast<uint32>(std::min<uint64>(rowCount, 0xFFFFFFFFull));
+}
+
+AuctionatorMarketData::ScanResult AuctionatorMarketData::ScanAuctionHouse(uint32 excludeOwner)
+{
+    ScanResult result;
+
+    if (!TableIsReady())
+    {
+        logWarn("market scan skipped: " + MarketTableName + " is not ready.");
+        return result;
+    }
+
+    // One timestamp for the whole batch, and the database produces it: the readers age a scan
+    // with TIMESTAMPDIFF against NOW(), so both sides have to use the database's own clock and
+    // time zone. It is also what makes the rows of this scan countable afterwards.
+    uint64 const scanEpoch = static_cast<uint64>(std::time(nullptr));
+    std::string const scanDatetime = "FROM_UNIXTIME(" + std::to_string(scanEpoch) + ")";
+
+    // How much there is to sample and how much of it belongs to the excluded owner. Reported by
+    // the caller, so a scan that writes nothing can say why instead of just looking broken
+    // (which is exactly what happens on a realm whose house only holds the bot's own listings).
+    std::string const compositionSql =
+        "SELECT COUNT(*), COALESCE(SUM(ah.itemowner = " + std::to_string(excludeOwner) + "), 0)"
+        " FROM auctionhouse ah"
+        " INNER JOIN item_instance ii ON ii.guid = ah.itemguid"
+        " WHERE ii.itemEntry > 0 AND ii.count > 0";
+
+    if (QueryResult composition = CharacterDatabase.Query(compositionSql))
+    {
+        Field* fields = composition->Fetch();
+        result.totalListings = fields[0].Get<uint32>();
+        result.skippedSelf = fields[1].Get<uint32>();
+    }
+
+    if (result.totalListings == 0)
+    {
+        // An empty house is not an error: there is simply nothing to price yet.
+        logInfo("market scan: the auction house holds no usable listing.");
+        result.ok = true;
+        return result;
+    }
+
+    // The excluded owner is only ever an integer from the configuration, so it is safe to inline
+    // (and it keeps this statement free of format placeholders, which the SQL itself would
+    // otherwise have to escape).
+    std::string const ownerFilter = excludeOwner != 0
+        ? " AND ah.itemowner <> " + std::to_string(excludeOwner)
+        : "";
+
+    //
+    // The whole aggregation is this one statement; the module only supplies the owner filter and
+    // the scan timestamp.
+    //
+    // Prices in `auctionhouse` are stored for the entire stack, while the market table holds a
+    // per-unit price (the seller multiplies it by the stack itself), so every price is divided by
+    // item_instance.count.
+    //
+    // average_price is the traded-volume weighted unit price: a buyout where the listing has one,
+    // and only for items whose listings carry no buyout at all the start bid, so a realm running
+    // bid-only listings still gets a price instead of nothing while items that do have buyouts are
+    // not dragged down by reserves.
+    //
+    // `buyout`/`bid` keep the cheapest unit buyout/start bid seen, matching the CSV export's
+    // minimum_buyout/minimum_bid columns (the seller and the bidder only read average_price and
+    // the volume, but the columns belong to the table's format).
+    //
+    std::string const scanSql =
+        "INSERT INTO " + MarketTableName
+        + " (entry, average_price, buyout, bid, `count`, scan_datetime, source)"
+          " SELECT s.entry, LEAST(" + std::to_string(MaxScanValue) + ", GREATEST(1, s.average_price)),"
+          " LEAST(" + std::to_string(MaxScanValue) + ", s.min_buyout),"
+          " LEAST(" + std::to_string(MaxScanValue) + ", s.min_bid),"
+          " s.listings, " + scanDatetime + ", '" + ScanSource + "'"
+          " FROM ("
+          "  SELECT ii.itemEntry AS entry,"
+          "   COALESCE("
+          "    ROUND(SUM(CASE WHEN ah.buyoutprice > 0 THEN ah.buyoutprice END)"
+          "          / NULLIF(SUM(CASE WHEN ah.buyoutprice > 0 THEN ii.count END), 0)),"
+          "    ROUND(SUM(CASE WHEN ah.startbid > 0 THEN ah.startbid END)"
+          "          / NULLIF(SUM(CASE WHEN ah.startbid > 0 THEN ii.count END), 0)),"
+          "    0) AS average_price,"
+          "   COALESCE("
+          "    MIN(CASE WHEN ah.buyoutprice > 0 THEN ROUND(ah.buyoutprice / ii.count) END),"
+          "    MIN(CASE WHEN ah.startbid > 0 THEN ROUND(ah.startbid / ii.count) END),"
+          "    0) AS min_buyout,"
+          "   COALESCE(MIN(CASE WHEN ah.startbid > 0 THEN ROUND(ah.startbid / ii.count) END), 0) AS min_bid,"
+          "   COUNT(*) AS listings"
+          "  FROM auctionhouse ah"
+          "  INNER JOIN item_instance ii ON ii.guid = ah.itemguid"
+          "  WHERE ii.itemEntry > 0 AND ii.count > 0" + ownerFilter
+        + "  GROUP BY ii.itemEntry"
+          " ) s"
+          " WHERE s.average_price >= 1";
+
+    // DirectExecute, not Execute: the count below has to see this statement's rows, and Execute
+    // only queues the query on the database thread pool. (Neither returns a status - a rejected
+    // statement lands in the sql log, which is why the empty-result case below names it.)
+    CharacterDatabase.DirectExecute(scanSql);
+
+    // Exact for what was just written: the world thread is the only writer of this table (the
+    // timer import, the GM commands and this scan), and the timestamp identifies the batch.
+    std::string const countSql =
+        "SELECT COUNT(*), COALESCE(CAST(SUM(`count`) AS UNSIGNED), 0) FROM " + MarketTableName
+        + " WHERE scan_datetime = " + scanDatetime + " AND source = '" + ScanSource + "'";
+
+    if (QueryResult written = CharacterDatabase.Query(countSql))
+    {
+        Field* fields = written->Fetch();
+        result.rows = fields[0].Get<uint32>();
+        result.listings = fields[1].Get<uint32>();
+    }
+
+    result.ok = true;
+
+    if (result.rows == 0)
+    {
+        if (excludeOwner != 0 && result.skippedSelf == result.totalListings)
+        {
+            // The common case on a realm the bot has to itself: everything in the house belongs
+            // to the auctionator, so excluding it leaves nothing to price. Say so explicitly -
+            // the timer path has no GM reading a chat reply, and "wrote nothing" on its own
+            // looks like a broken scan.
+            logWarn("market scan wrote nothing: all " + std::to_string(result.totalListings)
+                + " usable listing(s) in the house belong to the auctionator itself, and "
+                  "Auctionator.MarketData.ScanExcludeSelf leaves those out. Set it to 0 to sample them too, "
+                  "or point Auctionator.MarketData.ImportFile at an external export.");
+        }
+        else
+        {
+            logWarn("market scan wrote nothing although the house holds " + std::to_string(result.totalListings)
+                + " usable listing(s) and " + std::to_string(result.totalListings - result.skippedSelf)
+                + " were sampled. If the aggregation was rejected the reason is in the sql log; "
+                  "otherwise no sampled listing carried a price at all.");
+        }
+    }
+    else
+    {
+        logInfo("market scan: wrote " + std::to_string(result.rows) + " item price(s) from "
+            + std::to_string(result.listings) + " of " + std::to_string(result.totalListings)
+            + " listing(s)"
+            + (excludeOwner != 0
+                ? " (excluded " + std::to_string(result.skippedSelf) + " belonging to the auctionator)."
+                : " (the auctionator's own listings included)."));
+    }
+
+    return result;
 }
 
 bool AuctionatorMarketData::GetStats(uint32 maxAgeDays, Stats& stats)

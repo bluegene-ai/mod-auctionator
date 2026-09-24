@@ -40,6 +40,7 @@ class AuctionatorEvents : public AuctionatorBase
         void EventHordeSeller();
         void EventNeutralSeller();
         void EventMarketImport();
+        void EventMarketScan();
         void ExecuteEvents();
         // deltaMilliseconds: is fed straight into EventMap, which counts in ms.
         void Update(uint32 deltaMilliseconds);

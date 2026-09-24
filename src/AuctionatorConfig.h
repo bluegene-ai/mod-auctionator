@@ -108,6 +108,17 @@ class AuctionatorConfig
         uint32 marketDataImportIntervalMinutes = 360;
         uint32 marketDataImportMaxRows = 50000;
         uint32 marketDataRetentionDays = 30;
+
+        // How often the realm's own auction house is sampled into the market table
+        // ("market scan", see AuctionatorMarketData::ScanAuctionHouse). 0 = never on a timer:
+        // the GM command ".auctionator marketscan" (and the panel button) still works.
+        uint32 marketDataScanIntervalMinutes = 0;
+
+        // 1 = the auctionator character's own listings are left out of that sample, so the
+        // "market" price is not a mirror of the bot's last listing. 0 = sample every listing,
+        // which is what a realm whose house only holds the bot's own stock needs to get any
+        // price at all (the panel and the command both report the owner split either way).
+        uint32 marketDataScanExcludeSelf = 1;
 };
 
 #endif

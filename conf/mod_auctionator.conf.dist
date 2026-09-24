@@ -195,6 +195,11 @@ Auctionator.Seller.BidStartModifier = .3
 #     row only. Rows still on the default mode = 'legacy' follow this switch, which is
 #     what every row did before the column existed.
 #
+# ".auctionator buyout <0|1>" flips this switch on the running server for the whole realm
+# without a restart (1 = buyout on, i.e. this option set to 0). The management panel's
+# buyout button writes this option and sends that command, so the choice both applies at
+# once and survives a restart.
+#
 # Notes:
 #   * The core fully supports buyout 0 (it is what a player listing with an empty
 #     buyout sends), so nothing else has to change.
@@ -247,7 +252,8 @@ Auctionator.Seller.BidOnly = 0
 #     CSV export to import into mod_auctionator_market_price on a timer, so the
 #     server does not need an external cron job or the mysql client.
 #     Absolute path, or relative to the worldserver working directory.
-#     Empty = disabled (use the apps/marketprice script instead).
+#     Empty = disabled (use the apps/marketprice script instead, or the auction
+#     house scan below, which needs no export at all).
 #     Columns, with an optional header line:
 #         scan_datetime,item_entry,avg_price,minimum_buyout,minimum_bid,item_count
 #     Default: "" (disabled)
@@ -266,21 +272,52 @@ Auctionator.Seller.BidOnly = 0
 #     huge file stalls it for as long as it takes to write these rows.
 #     Default: 50000
 #
+# Auctionator.MarketData.ScanIntervalMinutes
+#     How often this realm's OWN auction house is sampled into
+#     mod_auctionator_market_price ("market scan"). The whole aggregation is one SQL
+#     statement over characters.auctionhouse + item_instance, so no CSV export and no
+#     external tool is involved: prices are per single item (the house stores them for
+#     the whole stack), a listing's buyout is preferred and the start bid is the
+#     fallback for items whose listings carry no buyout at all, averaged weighted by
+#     the stacked volume. Rows written this way carry source = 'ah-scan'.
+#     0 = never on a timer; the GM command ".auctionator marketscan" and the panel
+#     button still work. Minimum 1 when set. The first scan runs about one minute
+#     after startup. Default: 0
+#
+# Auctionator.MarketData.ScanExcludeSelf
+#     1 = the auctionator character's own listings are left out of that sample, so the
+#         "market" price reflects what other people are asking instead of mirroring the
+#         bot's own last listing (and so a price change of yours is not frozen in by
+#         your own stock for MarketData.MaxAgeDays).
+#     0 = sample every listing. Needed on a realm whose house holds nothing but the
+#         bot's own stock, otherwise a scan has nothing to price and writes 0 rows.
+#     Either way ".auctionator marketscan" reports how many listings were sampled and
+#     how many belonged to the auctionator itself.
+#     Default: 1
+#
 # Auctionator.MarketData.RetentionDays
 #     Default retention used by ".auctionator marketprune [days]". Importing keeps
-#     history (one row per item and scan), so old rows should be pruned now and
-#     then. Default: 30
+#     history (one row per item and scan), so old rows should be pruned now and then.
+#     The auction house scan adds one row per item each run, so on a short interval it
+#     is the main reason to prune. Default: 30
 #
 # NOTE on scan_datetime: the stored timestamp is interpreted in the database
 # server's time zone. The age of a scan is computed by the database itself
 # (TIMESTAMPDIFF against NOW()), so the importer and the readers agree only if the
-# CSV carries local time of the database host.
+# CSV carries local time of the database host. The market scan has no such caveat:
+# it lets the database produce the timestamp itself.
+#
+# NOTE on market prices and the quality multipliers: a listing priced from market data
+# ignores Auctionator.Multipliers.Seller.*, so once this table has rows for an item the
+# multipliers no longer apply to it (see the pricing section above).
 ########################################
 Auctionator.MarketData.MaxAgeDays = 14
 Auctionator.MarketData.ImportFile = ""
 Auctionator.MarketData.ImportSource = file
 Auctionator.MarketData.ImportIntervalMinutes = 360
 Auctionator.MarketData.ImportMaxRows = 50000
+Auctionator.MarketData.ScanIntervalMinutes = 0
+Auctionator.MarketData.ScanExcludeSelf = 1
 Auctionator.MarketData.RetentionDays = 30
 Auctionator.Seller.PreferMarketItems = 1
 Auctionator.Seller.ExcludeUnverifiedItems = 0
@@ -313,8 +350,21 @@ Auctionator.Seller.MaxPriceModifier = 2.0
 # mod_auctionator_disabled_items  (item)
 #     Flat blacklist: any item_template.entry listed here is never auctioned.
 #
-# Both tables can be edited live; the seller picks the changes up on its next
-# cycle (no restart needed).
+# mod_auctionator_quality_config  (quality, enabled)
+#     One row per item_template.quality (0 poor ... 7 heirloom).
+#       enabled = 0  that quality is never listed by the automatic seller
+#       enabled = 1  it may be listed
+#       no row       allowed as well, so an empty table (or a world database that has
+#                    not run the 2026_09_24_01 update yet) keeps listing exactly what
+#                    it used to. The gate can therefore only remove qualities a GM
+#                    turned off, never add surprises.
+#     Independent of the class whitelist above: an item must match a class row AND not
+#     sit on a disabled quality.
+#
+# All three tables can be edited live; the seller picks the changes up on its next
+# cycle (no restart needed). Note that mod_auctionator_itemclass_config is a WHITELIST:
+# its rows are inner-joined, so a class/subclass without a row is never listed - add the
+# rows to include a type, set max_count = 0 to exclude it.
 ########################################
 
 ########################################

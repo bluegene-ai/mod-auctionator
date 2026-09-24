@@ -14,14 +14,14 @@
 --     The DEFAULT names are spelled out below only because a helper file has to
 --     write something down.
 --
--- On an install with non-default names (this machine uses acore_world80 /
--- acore_characters80), make a local copy with the names substituted:
+-- On an install with non-default names, make a local copy with the names
+-- substituted (use the schema names from your own worldserver.conf):
 --
---   pwsh: (Get-Content useful_queries.sql) -replace 'acore_world','acore_world80' -replace 'acore_characters','acore_characters80' | Set-Content useful_queries.local.sql
---   bash: sed -e 's/acore_world/acore_world80/g' -e 's/acore_characters/acore_characters80/g' useful_queries.sql > useful_queries.local.sql
+--   pwsh: (Get-Content useful_queries.sql) -replace 'acore_world','<world_db>' -replace 'acore_characters','<characters_db>' | Set-Content useful_queries.local.sql
+--   bash: sed -e 's/acore_world/<world_db>/g' -e 's/acore_characters/<characters_db>/g' useful_queries.sql > useful_queries.local.sql
 --
--- (useful_queries.local.sql is gitignored; read the real names from your own
--- worldserver.conf rather than trusting the defaults above.)
+-- (useful_queries.local.sql is gitignored, so a substituted copy with real schema
+-- names never lands in the repository.)
 -- ---------------------------------------------------------------------------
 
 
@@ -203,7 +203,64 @@ FROM acore_characters.mod_auctionator_market_price;
 
 
 -- ---------------------------------------------------------------------------
--- 7) Investigate the bot's mailbox (should normally stay empty: the mail script
+-- 7) Market prices from THIS realm's own auction house.
+--
+--    This is the statement ".auctionator marketscan" runs (the module keeps the
+--    canonical copy in AuctionatorMarketData::ScanAuctionHouse); it is repeated here
+--    for people who would rather run it from cron or the mysql client, with
+--    Auctionator.MarketData.ScanIntervalMinutes left at 0.
+--
+--    Characters database only: auctionhouse, item_instance and the market table all
+--    live there. Prices in `auctionhouse` are for the whole stack while the market
+--    table wants a per-unit price, hence the division by item_instance.count.
+--    Replace 2 with Auctionator.CharacterGuid to leave the bot's own listings out of
+--    the sample (what ScanExcludeSelf = 1 does); delete that one line to sample
+--    everything, which is what a house holding only the bot's stock needs.
+-- ---------------------------------------------------------------------------
+INSERT INTO acore_characters.mod_auctionator_market_price
+    (entry, average_price, buyout, bid, `count`, scan_datetime, source)
+SELECT
+    s.entry
+    , LEAST(2147483647, GREATEST(1, s.average_price))
+    , LEAST(2147483647, s.min_buyout)
+    , LEAST(2147483647, s.min_bid)
+    , s.listings
+    , NOW()
+    , 'ah-scan'
+FROM (
+    SELECT
+        ii.itemEntry AS entry
+        -- Volume weighted per-unit price: buyouts preferred, start bids only for items
+        -- whose listings carry no buyout at all.
+        , COALESCE(
+            ROUND(SUM(CASE WHEN ah.buyoutprice > 0 THEN ah.buyoutprice END)
+                  / NULLIF(SUM(CASE WHEN ah.buyoutprice > 0 THEN ii.count END), 0))
+            , ROUND(SUM(CASE WHEN ah.startbid > 0 THEN ah.startbid END)
+                  / NULLIF(SUM(CASE WHEN ah.startbid > 0 THEN ii.count END), 0))
+            , 0) AS average_price
+        , COALESCE(
+            MIN(CASE WHEN ah.buyoutprice > 0 THEN ROUND(ah.buyoutprice / ii.count) END)
+            , MIN(CASE WHEN ah.startbid > 0 THEN ROUND(ah.startbid / ii.count) END)
+            , 0) AS min_buyout
+        , COALESCE(MIN(CASE WHEN ah.startbid > 0 THEN ROUND(ah.startbid / ii.count) END), 0) AS min_bid
+        , COUNT(*) AS listings
+    FROM acore_characters.auctionhouse ah
+    INNER JOIN acore_characters.item_instance ii ON ii.guid = ah.itemguid
+    WHERE ii.itemEntry > 0
+      AND ii.count > 0
+      AND ah.itemowner <> 2      -- Auctionator.CharacterGuid: ScanExcludeSelf = 1
+    GROUP BY ii.itemEntry
+) s
+WHERE s.average_price >= 1;
+
+-- How many rows the scan above just wrote (same timestamp, same source).
+SELECT COUNT(*) AS rows_written, COALESCE(SUM(`count`), 0) AS listings_sampled
+FROM acore_characters.mod_auctionator_market_price
+WHERE source = 'ah-scan' AND scan_datetime = (SELECT MAX(scan_datetime) FROM acore_characters.mod_auctionator_market_price WHERE source = 'ah-scan');
+
+
+-- ---------------------------------------------------------------------------
+-- 8) Investigate the bot's mailbox (should normally stay empty: the mail script
 --    recycles auction mail for the configured auctionator character)
 -- ---------------------------------------------------------------------------
 SELECT
@@ -226,7 +283,7 @@ LIMIT 200;
 
 
 -- ---------------------------------------------------------------------------
--- 8) Auction house totals per house (the same number .auctionator status shows)
+-- 9) Auction house totals per house (the same number .auctionator status shows)
 -- ---------------------------------------------------------------------------
 SELECT ah.houseId, COUNT(*) AS auctions
 FROM acore_characters.auctionhouse ah

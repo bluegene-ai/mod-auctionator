@@ -21,7 +21,8 @@ namespace
         AUCTIONATOR_EVENT_HORDE_SELLER    = 5,
         AUCTIONATOR_EVENT_NEUTRAL_SELLER  = 6,
         AUCTIONATOR_EVENT_MARKET_IMPORT   = 7,
-        AUCTIONATOR_EVENT_COUNT           = 7
+        AUCTIONATOR_EVENT_MARKET_SCAN     = 8,
+        AUCTIONATOR_EVENT_COUNT           = 8
     };
 }
 
@@ -49,7 +50,8 @@ void AuctionatorEvents::InitializeEvents()
             {AUCTIONATOR_EVENT_ALLIANCE_SELLER, "AllianceSeller"},
             {AUCTIONATOR_EVENT_HORDE_SELLER, "HordeSeller"},
             {AUCTIONATOR_EVENT_NEUTRAL_SELLER, "NeutralSeller"},
-            {AUCTIONATOR_EVENT_MARKET_IMPORT, "MarketImport"}
+            {AUCTIONATOR_EVENT_MARKET_IMPORT, "MarketImport"},
+            {AUCTIONATOR_EVENT_MARKET_SCAN, "MarketScan"}
         };
 
     eventHandlers = {
@@ -59,7 +61,8 @@ void AuctionatorEvents::InitializeEvents()
             {AUCTIONATOR_EVENT_ALLIANCE_SELLER, &AuctionatorEvents::EventAllianceSeller},
             {AUCTIONATOR_EVENT_HORDE_SELLER, &AuctionatorEvents::EventHordeSeller},
             {AUCTIONATOR_EVENT_NEUTRAL_SELLER, &AuctionatorEvents::EventNeutralSeller},
-            {AUCTIONATOR_EVENT_MARKET_IMPORT, &AuctionatorEvents::EventMarketImport}
+            {AUCTIONATOR_EVENT_MARKET_IMPORT, &AuctionatorEvents::EventMarketImport},
+            {AUCTIONATOR_EVENT_MARKET_SCAN, &AuctionatorEvents::EventMarketScan}
         };
 
     // uint16 matches EventMap's event id type.
@@ -67,9 +70,11 @@ void AuctionatorEvents::InitializeEvents()
     {
         if (IsEventEnabled(eventId))
         {
-            // The market import is the only event that wants an early first run, so a
-            // fresh deployment picks up the current export.
-            uint32 const firstDelayMinutes = eventId == AUCTIONATOR_EVENT_MARKET_IMPORT
+            // The market events want an early first run, so a fresh deployment (or a GM who just
+            // turned one on) gets data instead of waiting out a multi-hour interval.
+            bool const earlyFirstRun = eventId == AUCTIONATOR_EVENT_MARKET_IMPORT
+                || eventId == AUCTIONATOR_EVENT_MARKET_SCAN;
+            uint32 const firstDelayMinutes = earlyFirstRun
                 ? 1
                 : GetEventInterval(eventId).count();
 
@@ -100,6 +105,10 @@ bool AuctionatorEvents::IsEventEnabled(uint16 currentEvent) const
             return config->neutralSeller.enabled != 0;
         case AUCTIONATOR_EVENT_MARKET_IMPORT:
             return !config->marketDataImportFile.empty();
+        case AUCTIONATOR_EVENT_MARKET_SCAN:
+            // 0 = only on demand: the GM command and the panel button still work, the timer
+            // simply never fires.
+            return config->marketDataScanIntervalMinutes > 0;
         default:
             return false;
     }
@@ -136,6 +145,8 @@ std::chrono::minutes AuctionatorEvents::GetEventInterval(uint16 currentEvent) co
             return ClampEventInterval(config->neutralSeller.cycleMinutes);
         case AUCTIONATOR_EVENT_MARKET_IMPORT:
             return ClampEventInterval(config->marketDataImportIntervalMinutes);
+        case AUCTIONATOR_EVENT_MARKET_SCAN:
+            return ClampEventInterval(config->marketDataScanIntervalMinutes);
         default:
             return std::chrono::minutes(1);
     }
@@ -422,4 +433,18 @@ void AuctionatorEvents::EventMarketImport()
         config->marketDataImportMaxRows,
         false
     );
+}
+
+void AuctionatorEvents::EventMarketScan()
+{
+    if (!config || config->marketDataScanIntervalMinutes == 0) {
+        return;
+    }
+
+    logInfo("Starting market scan (auction house sample)");
+
+    // Same rule as the GM command and the panel button: ScanExcludeSelf decides whether the
+    // auctionator's own listings take part in the sample.
+    AuctionatorMarketData marketData;
+    marketData.ScanAuctionHouse(config->marketDataScanExcludeSelf != 0 ? config->characterGuid : 0);
 }

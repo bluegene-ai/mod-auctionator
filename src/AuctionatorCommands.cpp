@@ -279,6 +279,11 @@ class AuctionatorCommands : public CommandScript
                 return CommandMarketImport(commandParams, handler, auctionator);
             }
 
+            if (command == "marketscan")
+            {
+                return CommandMarketScan(commandParams, handler, auctionator);
+            }
+
             if (command == "marketprune")
             {
                 return CommandMarketPrune(commandParams, handler, auctionator);
@@ -292,6 +297,14 @@ class AuctionatorCommands : public CommandScript
             if (command == "bidonown")
             {
                 return CommandBidOnOwn(commandParams, handler, auctionator);
+            }
+
+            // Quick buyout switch. The flag is read for every listing the seller creates, so
+            // this takes effect on the next run without a restart; the panel persists it in the
+            // option file as well.
+            if (command == "buyout")
+            {
+                return CommandSetBuyout(commandParams, handler, auctionator);
             }
 
             if (command == "bidspercycle")
@@ -1124,6 +1137,54 @@ class AuctionatorCommands : public CommandScript
             return true;
         }
 
+        // .auctionator marketscan
+        //
+        // Prices this realm's own auction house into mod_auctionator_market_price, so the seller
+        // gets market prices without an external CSV export. The aggregation itself is one SQL
+        // statement (see AuctionatorMarketData::ScanAuctionHouse); the same routine runs on a
+        // timer when Auctionator.MarketData.ScanIntervalMinutes is above 0.
+        static bool CommandMarketScan(std::vector<std::string> const& params, ChatHandler* handler, Auctionator* auctionator)
+        {
+            if (!params.empty())
+            {
+                handler->SendSysMessage("[Auctionator] marketscan: usage (no arguments)");
+                return true;
+            }
+
+            bool const excludeSelf = auctionator->config->marketDataScanExcludeSelf != 0;
+
+            AuctionatorMarketData marketData;
+            AuctionatorMarketData::ScanResult const result = marketData.ScanAuctionHouse(
+                excludeSelf ? auctionator->config->characterGuid : 0
+            );
+
+            if (!result.ok)
+            {
+                handler->SendSysMessage("[Auctionator] marketscan: failed, see the server log ("
+                    + std::to_string(result.totalListings) + " listing(s) were readable).");
+                return true;
+            }
+
+            handler->SendSysMessage("[Auctionator] marketscan: wrote " + std::to_string(result.rows)
+                + " item price(s) from " + std::to_string(result.listings) + " listing(s) of "
+                + std::to_string(result.totalListings) + " in the house"
+                + (excludeSelf
+                    ? " (excluded " + std::to_string(result.skippedSelf) + " belonging to the auctionator)"
+                    : " (the auctionator's own listings are included)")
+                + ". Check \".auctionator market\".");
+
+            if (result.rows == 0 && excludeSelf && result.skippedSelf == result.totalListings)
+            {
+                // The honest explanation for the most likely empty result: nothing to sample but
+                // the bot's own stock, which is excluded on purpose.
+                handler->SendSysMessage("[Auctionator] marketscan: every listing in this house belongs to the "
+                    "auctionator itself. Set Auctionator.MarketData.ScanExcludeSelf = 0 to sample those as well, "
+                    "or point Auctionator.MarketData.ImportFile at an external export.");
+            }
+
+            return true;
+        }
+
         // .auctionator marketprune [days]
         static bool CommandMarketPrune(std::vector<std::string> const& params, ChatHandler* handler, Auctionator* auctionator)
         {
@@ -1189,6 +1250,13 @@ market
      market price table: rows, distinct items, usable scans, import config
 marketimport [force]
      import the CSV configured in Auctionator.MarketData.ImportFile now
+marketscan
+     price this realm's own auction house into mod_auctionator_market_price:
+     one row per item, per-unit prices, buyout preferred and the start bid used
+     only for items whose listings carry no buyout at all. No external CSV needed.
+     Auctionator.MarketData.ScanExcludeSelf = 1 (default) leaves the auctionator's
+     own listings out of the sample; set it to 0 on a realm whose house only holds
+     the bot's stock. Run it on a timer with Auctionator.MarketData.ScanIntervalMinutes.
 marketprune [days]
      delete market scans older than the retention (default from the config)
 auctionspercycle <value>
@@ -1196,7 +1264,17 @@ auctionspercycle <value>
 bidspercycle <value>
      set how many auctions each bidder run may buy (all three houses)
 bidonown <0|1>
-     allow the bidder to bid on the auctionator's own auctions (testing)
+     let the bidder bid on the auctionator's own auctions (testing only)
+buyout <0|1>
+     1 = listings carry a buyout (Auctionator.Seller.BidOnly = 0) and the start bid
+         is derived from Auctionator.Seller.BidStartModifier
+     0 = no buyout at all (Auctionator.Seller.BidOnly = 1): the computed price
+         becomes the start bid and the entry can only be won by bidding
+     Applies to the whole realm at once (automatic seller, the positional
+     ".auctionator add" form and every gm_list row still on mode = legacy) and takes
+     effect on the next seller run. Only the running configuration changes; the
+     panel's buyout switch also writes Auctionator.Seller.BidOnly to the option
+     file so the choice survives a restart.
 disable <hordeseller|allianceseller|neutralseller|hordebidder|alliancebidder|neutralbidder|all>
 enable <same targets as disable>
 start | on
@@ -1294,6 +1372,10 @@ help
             statusString += "    Default Price (no vendor/market price): " + std::to_string(auctionator->config->sellerConfig.defaultPrice) + "\n";
             statusString += "    Randomize Stack Size: " + std::to_string(auctionator->config->sellerConfig.randomizeStackSize) + "\n";
             statusString += "    Bid Start Modifier: " + std::to_string(auctionator->config->sellerConfig.bidStartModifier) + "\n";
+            // Surfaced for the panel's quick switch: "off" means Auctionator.Seller.BidOnly = 1,
+            // i.e. listings have no buyout and can only be won by bidding.
+            statusString += "    Buyout mode: " + std::string(auctionator->config->sellerConfig.bidOnly != 0 ? "off (bidding only)" : "on")
+                + " (Auctionator.Seller.BidOnly = " + std::to_string(auctionator->config->sellerConfig.bidOnly != 0 ? 1 : 0) + ")\n";
             statusString += "    Market data max age (days, seller+bidder, 0 = never): " + std::to_string(auctionator->config->marketDataMaxAgeDays) + "\n";
             statusString += "    Prefer market items: " + std::to_string(auctionator->config->sellerConfig.preferMarketItems) + "\n";
             statusString += "    Exclude VerifiedBuild = 1 items: " + std::to_string(auctionator->config->sellerConfig.excludeUnverifiedItems) + "\n";
@@ -1599,6 +1681,56 @@ help
                     + std::to_string(newMultiplier));
             } else {
                 handler->SendSysMessage("[Auctionator] unable to set multiplier");
+            }
+
+            return true;
+        }
+
+        // .auctionator buyout <0|1>
+        //
+        // 1 = listings carry a buyout again (Auctionator.Seller.BidOnly = 0), so the computed
+        // price is the buyout and the start bid is derived from BidStartModifier as usual.
+        // 0 = no buyout at all (Auctionator.Seller.BidOnly = 1): the computed price becomes the
+        // start bid and the entry can only be won by bidding.
+        //
+        // Only the running configuration is changed, never the option file: this is the "apply
+        // it now" half of the panel's buyout switch, which persists the same choice into
+        // mod_auctionator.conf itself. The seller reads the flag for every listing it creates,
+        // so the next run already follows it - no restart involved.
+        static bool CommandSetBuyout(std::vector<std::string> const& params, ChatHandler* handler, Auctionator* auctionator)
+        {
+            if (params.size() != 1)
+            {
+                handler->SendSysMessage("[Auctionator] buyout: usage <0|1> "
+                    "(1 = listings have a buyout, 0 = no buyout, bidding only)");
+                return true;
+            }
+
+            uint32 enabled = 0;
+            if (!TryParseUInt32(params[0], enabled) || enabled > 1)
+            {
+                handler->SendSysMessage("[Auctionator] buyout: expected 1 (listings have a buyout) "
+                    "or 0 (no buyout, bidding only).");
+                return true;
+            }
+
+            WarnIfModuleDisabled(handler, auctionator);
+
+            auctionator->config->sellerConfig.bidOnly = enabled == 1 ? 0 : 1;
+
+            if (enabled == 1)
+            {
+                handler->SendSysMessage("[Auctionator] buyout: enabled - listings get a buyout again "
+                    "(Auctionator.Seller.BidOnly = 0), and the start bid is derived from "
+                    "Auctionator.Seller.BidStartModifier. Takes effect on the next seller run.");
+                auctionator->logInfo("buyout: enabled (Auctionator.Seller.BidOnly = 0)");
+            }
+            else
+            {
+                handler->SendSysMessage("[Auctionator] buyout: disabled - listings have no buyout "
+                    "(Auctionator.Seller.BidOnly = 1), so they can only be won by bidding. "
+                    "Takes effect on the next seller run.");
+                auctionator->logInfo("buyout: disabled (Auctionator.Seller.BidOnly = 1)");
             }
 
             return true;

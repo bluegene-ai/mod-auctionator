@@ -511,6 +511,10 @@ void Auctionator::InitializeConfig(ConfigMgr* configMgr)
         configMgr->GetOption<uint32>("Auctionator.MarketData.ImportMaxRows", 50000)
     );
     config->marketDataRetentionDays = configMgr->GetOption<uint32>("Auctionator.MarketData.RetentionDays", 30);
+    // Auction house scan. 0 stays 0 here (unlike the import interval above): 0 means "only when a
+    // GM asks", and ClampEventInterval() keeps a non-zero value from scheduling a zero interval.
+    config->marketDataScanIntervalMinutes = configMgr->GetOption<uint32>("Auctionator.MarketData.ScanIntervalMinutes", 0);
+    config->marketDataScanExcludeSelf = configMgr->GetOption<uint32>("Auctionator.MarketData.ScanExcludeSelf", 1);
     config->sellerConfig.preferMarketItems = configMgr->GetOption<uint32>("Auctionator.Seller.PreferMarketItems", 1);
     config->sellerConfig.excludeUnverifiedItems = configMgr->GetOption<uint32>("Auctionator.Seller.ExcludeUnverifiedItems", 0);
     config->sellerConfig.minPriceModifier = std::max(

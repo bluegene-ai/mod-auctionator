@@ -44,8 +44,9 @@ This mod is meant to keep a healthy auction house stocked on a low-pop server. I
    module's tables are never created, the seller finds no candidate items and the market
    import fails.
    If you prefer to do it by hand, run these against the matching database:
-   * world database: `data/sql/db-world/base/2023-09-18.sql` and
-     `data/sql/db-world/base/mod_auctionator_gm_list.sql`
+   * world database: `data/sql/db-world/base/2023-09-18.sql`,
+     `data/sql/db-world/base/mod_auctionator_gm_list.sql` and
+     `data/sql/db-world/base/mod_auctionator_quality_config.sql`
    * characters database, in this order:
      `data/sql/db-characters/updates/2023_11_12_00_marketprice.sql`,
      `data/sql/db-characters/updates/2026_09_20_00_market_price_history.sql`,
@@ -263,6 +264,28 @@ Valid values are `1` to enable and `0` to disable.
 
 ```
 .auctionator bidonown 1
+```
+
+### auctionator buyout <0|1>
+
+The quick switch for the shape of every listing the module creates, and the command behind
+the management panel's buyout toggle:
+
+* `1` - listings carry a buyout again (`Auctionator.Seller.BidOnly = 0`), and the starting
+  bid is derived from `Auctionator.Seller.BidStartModifier` as usual.
+* `0` - **no buyout at all** (`Auctionator.Seller.BidOnly = 1`): the price the seller
+  computed becomes the *start bid* and the entry can only be won by bidding. An entry
+  nobody bids on still expires and is recycled.
+
+It applies to the whole realm at once - the automatic seller, the positional
+`.auctionator add` form and every `mod_auctionator_gm_list` row that does not name a mode -
+and takes effect on the next seller run: the flag is read for every listing it creates, so
+no restart is involved. Only the running configuration changes; the panel's switch also
+writes `Auctionator.Seller.BidOnly` into the option file so the choice survives a restart.
+
+```
+.auctionator buyout 0    # bidding only
+.auctionator buyout 1    # buyout mode back on
 ```
 
 ### auctionator disable <target>
@@ -488,12 +511,51 @@ Progress goes to stderr, the SQL to stdout.
 `minimum_buyout` and `minimum_bid` are not used; `item_count` (volume) is used by
 the seller's market weighting.
 
+### Option C - price the realm's own auction house (no export at all)
+
+```
+.auctionator marketscan
+```
+
+or, to have it run by itself:
+
+```
+Auctionator.MarketData.ScanIntervalMinutes = 60
+Auctionator.MarketData.ScanExcludeSelf = 1
+```
+
+This aggregates the live listings of *this* realm's auction house
+(`characters.auctionhouse` + `item_instance`) into the market table with a single SQL
+statement - no CSV, no external tool, no cron. For each item it writes the
+volume-weighted **per-unit** price (the house stores whole-stack prices, so they are
+divided by the stack size), plus the cheapest unit buyout/start bid and the number of
+listings it sampled, as `source = 'ah-scan'`.
+
+* A listing's **buyout** is preferred. Only items whose listings carry no buyout at all
+  fall back to their **start bid**, so a realm running bid-only listings still gets
+  prices while items that do have buyouts are not dragged down by reserves.
+* `ScanExcludeSelf = 1` (the default) leaves the **auctionator character's own listings**
+  out of the sample. Otherwise the "market" price would just mirror the bot's own asking
+  price, and because a market-priced listing ignores the quality multipliers, your own
+  stock would freeze your last price in for `MaxAgeDays`. On a realm whose house holds
+  nothing but the bot's stock the scan therefore writes 0 rows - set it to `0` to sample
+  those too, and the command tells you when the owner split is the reason.
+* The command reports rows written, listings sampled and how many belonged to the
+  auctionator, so an empty result is explained instead of mysterious.
+* `ScanIntervalMinutes = 0` (the default) means "only when asked": the command and the
+  management panel's button still work, the timer simply never fires. The first timed
+  scan runs about a minute after startup.
+
+Because every run adds one row per item, prune the history periodically
+(`.auctionator marketprune 30`) when the interval is short.
+
 ### Operating it
 
 ```
 .auctionator market              # rows, distinct items, how many items have a usable scan
 .auctionator marketimport        # import Auctionator.MarketData.ImportFile now
 .auctionator marketimport force  # import even if the file did not change
+.auctionator marketscan          # price this realm's own auction house now
 .auctionator marketprune 30      # drop scans older than 30 days
 ```
 
@@ -546,6 +608,7 @@ Which items may be listed, and in what shape, is data driven (world database):
 |---|---|---|
 | `mod_auctionator_itemclass_config` | `class`, `subclass`, `bonding`, `max_count`, `stack_count` | one row per item class/subclass |
 | `mod_auctionator_disabled_items` | `item` | flat blacklist of `item_template.entry` |
+| `mod_auctionator_quality_config` | `quality`, `enabled` | one row per `item_template.quality` (0 poor .. 7 heirloom) |
 
 * `bonding` - minimum `item_template.bonding` for the row to match; `0` means "no
   additional constraint". Items with `bonding = 1` (bind on pickup) are always excluded.
@@ -560,6 +623,17 @@ Which items may be listed, and in what shape, is data driven (world database):
   so `NULL` cannot occur). With
   `Auctionator.Seller.RandomizeStackSize = 1` the listing uses a random value
   between 1 and `stack_count` instead of the full value.
+* `enabled` - the per-quality gate. `0` means that quality is **never** auto-listed;
+  `1`, or **no row at all**, means it may be. The "no row is allowed" rule keeps an
+  empty table (and a world database that has not run the update yet) listing exactly
+  what it used to, so the gate only ever removes qualities the GM turned off. It is
+  independent of the class whitelist: an item must match a class row *and* not sit on a
+  disabled quality.
+
+`mod_auctionator_itemclass_config` is a **whitelist**, not a blacklist: the seller's
+candidate query inner-joins it, so a class/subclass pair without a row is never listed.
+That is why a type is added by creating its rows (the panel's "apply to whole class" does
+this from `mod_auctionator_item_class`) and removed by setting `max_count = 0`.
 
 `item_template.VerifiedBuild = 1` rows are **not** filtered out by default: in most
 world databases that flag means "not verified by the content team", and skipping those
@@ -567,7 +641,8 @@ rows removes a large part of the eligible catalogue (~30% on a stock WotLK world
 database). Set `Auctionator.Seller.ExcludeUnverifiedItems = 1` if your data means
 something else by it.
 
-Both tables are read on every seller cycle, so edits apply without a restart.
+All three tables are read on every seller cycle, so edits apply on the next run without a
+restart.
 
 ## Economy and safety guarantees
 
@@ -628,8 +703,10 @@ These are invariants of the module, not side effects:
 2. ~~No control on stack size, it is hard coded to 20.~~ Stack size is data driven per
    class/subclass (`stack_count`, see "Item selection"), and GM listings take an
    explicit `stack` argument.
-3. Item selection is driven by `mod_auctionator_itemclass_config` and
-   `mod_auctionator_disabled_items`; there is still no in-game editor for them
+3. Item selection is driven by `mod_auctionator_itemclass_config` (the class whitelist),
+   `mod_auctionator_quality_config` (the per-quality gate) and
+   `mod_auctionator_disabled_items` (the flat blacklist); there is still no in-game editor for
+   them, but the management panel edits all three and they apply on the next seller run.
    (edit the tables and wait for the next seller cycle).
 4. The import is synchronous, so a very large CSV stalls the world thread while it
    is written. Keep `Auctionator.MarketData.ImportMaxRows` sane and prefer
