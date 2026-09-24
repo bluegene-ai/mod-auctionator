@@ -258,6 +258,14 @@ void AuctionatorEvents::ResyncSchedule()
     }
 }
 
+void AuctionatorEvents::CancelAllEvents()
+{
+    for (uint16 eventId = 1; eventId <= AUCTIONATOR_EVENT_COUNT; ++eventId)
+    {
+        events.CancelEvent(eventId);
+    }
+}
+
 void AuctionatorEvents::SetPlayerGuid(ObjectGuid playerGuid)
 {
     auctionatorGuid = playerGuid;

@@ -22,6 +22,14 @@
 #        seller/bidder switches below default to 0, so this only means "the module
 #        is allowed to work".
 #
+#        This file is per realm: a machine that runs several realms (sharing one auth
+#        database) has one worldserver directory, and therefore one copy of this file,
+#        per realm - that is what makes the bot independently controllable per realm.
+#        The value is read once at startup, so editing it here only takes effect on the
+#        next restart of *this* realm. ".auctionator start" / ".auctionator stop" flip
+#        the running module at once, and the AGMP panel's start/stop button writes this
+#        line and sends that command together.
+#
 Auctionator.Enabled = 1
 
 #    Auctionator.CharacterId

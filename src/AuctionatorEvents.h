@@ -46,6 +46,10 @@ class AuctionatorEvents : public AuctionatorBase
         // Schedules events that are enabled but not scheduled yet, and cancels the
         // ones that were disabled at runtime.
         void ResyncSchedule();
+        // Drops every pending timer. Used by the runtime master switch: while the module
+        // is stopped no event may keep ageing towards a due time, otherwise a long stop
+        // would end in a burst of overdue runs the moment it is started again.
+        void CancelAllEvents();
         void SetPlayerGuid(ObjectGuid playerGuid);
 };
 

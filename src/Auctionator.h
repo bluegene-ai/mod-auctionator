@@ -94,6 +94,12 @@ class Auctionator : public AuctionatorBase
         // Re-evaluates the event schedule from the current config flags, so that
         // ".auctionator enable/disable" takes effect without a restart.
         void ResyncEventSchedule();
+        // Runtime master switch ("Auctionator.Enabled"). That option is only read at
+        // startup, so without this a realm whose module was disabled in the conf could
+        // only be started by restarting its worldserver. Flips the switch in place and
+        // re-arms (or drops) the event schedule accordingly. Returns the state in effect
+        // after the call; false when the module has no config yet.
+        bool SetEnabled(bool enabled);
         bool IsReady() const
         {
             return initialized && config && session && sAuctionMgr && sWorld;

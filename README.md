@@ -82,6 +82,29 @@ This mod is meant to keep a healthy auction house stocked on a low-pop server. I
 > seller's item query fails with `Table ... doesn't exist` in the SQL log and the
 > seller logs "seller item query produced no rows".
 
+### Several realms on one machine (sharing one auth database)
+
+The module has no realm-wide singleton: a machine that runs several realms runs one
+`worldserver` per realm, each with its own worldserver directory, its own
+`configs/modules/mod_auctionator.conf`, its own `mod_auctionator*` tables (they live in
+that realm's world/characters databases) and its own bot character
+(`Auctionator.CharacterId` / `CharacterGuid` are per realm, and each realm needs its own
+dedicated, never-played character). Nothing in the module is keyed by realm id, so no
+extra configuration is required — but every realm needs the SQL from step 3 applied to
+*its* databases and the conf copied into *its* directory.
+
+Start and stop them independently:
+
+* per realm, at runtime: `.auctionator stop` / `.auctionator start` on that realm's
+  console (or through the AGMP panel's auction page, which writes that realm's
+  `Auctionator.Enabled` and sends the command in one step);
+* persistently: `Auctionator.Enabled` in that realm's
+  `configs/modules/mod_auctionator.conf`;
+* per house/role: `.auctionator enable|disable <target>`.
+
+Each realm keeps its own event schedule, so stopping one realm's bot never touches
+another's; auctions already listed in a stopped realm stay in its auction house.
+
 
 ```
 DELETE FROM `item_instance` WHERE `guid` IN (SELECT `itemguid` FROM `auctionhouse`);
@@ -194,7 +217,8 @@ Disable the seller or bidder for a particular faction. `<target>` is one of
 `alliancebidder`, `neutralbidder` or `all`.
 
 The change is applied to the running schedule immediately: no restart is needed
-(only the master switch `Auctionator.Enabled` requires one).
+(only the master switch `Auctionator.Enabled` requires one — or use
+`start` / `stop` below).
 
 ```
 .auctionator disable hordeseller
@@ -208,6 +232,34 @@ then the configured cycle time takes over.
 
 ```
 .auctionator enable hordeseller
+```
+
+### auctionator start | on
+
+Turn the module's master switch **on at runtime**. `Auctionator.Enabled` is read
+once, while the worldserver builds the Auctionator singleton, so without this a
+realm whose option file says `Auctionator.Enabled = 0` could only be started by
+restarting its worldserver. `start` flips the switch in place and re-arms the
+event schedule from the current per-house flags (first run about a minute later).
+
+This is a **runtime** switch: it is not written back to
+`configs/modules/mod_auctionator.conf`. Set `Auctionator.Enabled = 1` there to
+keep it across restarts — the AGMP panel's "start this realm's bot" button does
+both in one step.
+
+```
+.auctionator start
+```
+
+### auctionator stop | off
+
+Turn the master switch **off at runtime**: `Update()` stops feeding the event
+schedule and the pending timers are dropped, so a long stop cannot end in a burst
+of overdue runs. Auctions already listed are untouched, and the per-house flags
+are preserved, so `start` resumes exactly what was enabled before.
+
+```
+.auctionator stop
 ```
 
 ### auctionator expireall <house> [all]

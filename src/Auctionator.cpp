@@ -610,6 +610,37 @@ void Auctionator::ResyncEventSchedule()
     events.ResyncSchedule();
 }
 
+bool Auctionator::SetEnabled(bool enabled)
+{
+    if (!config)
+    {
+        return false;
+    }
+
+    if (config->isEnabled == enabled)
+    {
+        return config->isEnabled;
+    }
+
+    config->isEnabled = enabled;
+    logInfo(std::string("master switch ") + (enabled ? "enabled" : "disabled") + " at runtime");
+
+    if (enabled)
+    {
+        // Re-arm from the current flags: the events whose first run was missed while the
+        // module was stopped start about a minute from now instead of firing in a burst.
+        events.ResyncSchedule();
+    }
+    else
+    {
+        // Update() is gated on isEnabled, so nothing would run anyway; dropping the
+        // timers keeps a long stop from accumulating overdue work.
+        events.CancelAllEvents();
+    }
+
+    return config->isEnabled;
+}
+
 void Auctionator::ExpireAllAuctions(uint32 houseId, bool includePlayerAuctions)
 {
     if (houseId != (uint32)AuctionHouseId::Alliance &&

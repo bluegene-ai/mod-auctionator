@@ -199,6 +199,19 @@ class AuctionatorCommands : public CommandScript
                 return true;
             }
 
+            // Runtime master switch. "Auctionator.Enabled" is only read at startup, and the
+            // option file is per realm, so this is what lets one realm's bot be started or
+            // stopped from the panel without restarting that realm's worldserver.
+            if (command == "start" || command == "on")
+            {
+                return CommandSetEnabled(handler, auctionator, true);
+            }
+
+            if (command == "stop" || command == "off")
+            {
+                return CommandSetEnabled(handler, auctionator, false);
+            }
+
             if (command == "help")
             {
                 ShowHelp(handler);
@@ -838,6 +851,12 @@ bidonown <0|1>
      allow the bidder to bid on the auctionator's own auctions (testing)
 disable <hordeseller|allianceseller|neutralseller|hordebidder|alliancebidder|neutralbidder|all>
 enable <same targets as disable>
+start | on
+     runtime master switch ON (Auctionator.Enabled is only read at startup, so this is
+     what starts a realm's bot without restarting its worldserver). Runtime only: write
+     Auctionator.Enabled = 1 in this realm's mod_auctionator.conf to keep it after a restart.
+stop | off
+     runtime master switch OFF: clears the pending events. Already listed auctions stay.
 expireall <house> [all]
      without "all" only the auctionator's own auctions are expired; listings
      created with an explicit owner need "all"
@@ -865,7 +884,12 @@ help
         {
             std::string statusString = "[Auctionator] Status:\n\n";
 
-            statusString += " Enabled: " + std::to_string(auctionator->config->isEnabled) + "\n\n";
+            statusString += " Enabled (master switch, effective now): "
+                + std::to_string(auctionator->config->isEnabled)
+                + (auctionator->config->isEnabled
+                    ? " (running)"
+                    : " (stopped; \".auctionator start\" turns it on)")
+                + "\n\n";
             statusString += " Bid on Own: " + std::to_string(auctionator->config->bidOnOwn) + "\n";
             statusString += " CharacterGuid: " + std::to_string(auctionator->config->characterGuid) + "\n";
 
@@ -1004,9 +1028,54 @@ help
         {
             if (!auctionator->config->isEnabled)
             {
-                handler->SendSysMessage("[Auctionator] note: the module is disabled in the configuration "
-                    "(Auctionator.Enabled = 0); toggle it there and restart the server for these flags to take effect.");
+                handler->SendSysMessage("[Auctionator] note: the module master switch is off "
+                    "(Auctionator.Enabled = 0), so this flag has no effect yet. "
+                    "\".auctionator start\" turns the module on right now; the AGMP panel's start button also "
+                    "writes Auctionator.Enabled = 1 so it stays on after a restart.");
             }
+        }
+
+        // Console/SOAP replies of the state-changing commands carry the AGMP ack marker, so
+        // the panel's strict check can tell "the command reached the game" from "the SOAP
+        // call went nowhere". A player running the command in game sees the plain text.
+        static void ReplyAcked(ChatHandler* handler, bool success, std::string const& message)
+        {
+            char const* const marker = success ? "[AGMP_OK] " : "[AGMP_ERROR] ";
+            handler->SendSysMessage((handler->GetSession() == nullptr ? std::string(marker) : std::string()) + message);
+        }
+
+        // Shared by ".auctionator start" / ".auctionator stop". The flag is runtime only:
+        // Auctionator.Enabled is the persistent copy and is owned by the AGMP panel (which
+        // writes the realm's own option file before sending this command).
+        static bool CommandSetEnabled(ChatHandler* handler, Auctionator* auctionator, bool enable)
+        {
+            char const* const verb = enable ? "start" : "stop";
+
+            if (!auctionator->config)
+            {
+                ReplyAcked(handler, false, std::string("[Auctionator] ") + verb + ": config is not initialized yet.");
+                return true;
+            }
+
+            if (auctionator->SetEnabled(enable) != enable)
+            {
+                ReplyAcked(handler, false, std::string("[Auctionator] ") + verb + ": could not change the master switch.");
+                auctionator->logError(std::string(verb) + ": SetEnabled() refused the change.");
+                return true;
+            }
+
+            auctionator->logInfo(std::string(verb) + ": master switch is now "
+                + (enable ? "on" : "off") + " (runtime only)");
+            ReplyAcked(handler, true, std::string("[Auctionator] ") + verb + ": the module is now "
+                + (enable ? "ON" : "OFF")
+                + (enable
+                    ? ". Enabled events start about a minute from now; per-house flags still decide what runs."
+                    : ". Pending events cleared; player auctions already listed are untouched.")
+                + " This is a runtime switch only - "
+                + (enable ? "set Auctionator.Enabled = 1" : "set Auctionator.Enabled = 0")
+                + " in configs/modules/mod_auctionator.conf to make it survive a restart.");
+
+            return true;
         }
 
         // Shared by enable/disable: returns false when the target is unknown.
