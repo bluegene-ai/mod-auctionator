@@ -62,7 +62,13 @@ DELETE FROM `auctionhouse`;
 
 ### auctionator add <house> <item[,item...]> <price> [stack] [hours] [owner]
 
-ItemID 可以在数据库表 `item_template` 中查找。
+### auctionator add <house> <item[,item...]> mode=<buyout|bid> [bid=<铜>] [buyout=<铜>] [stack=<n>] [hours=<n>] [owner=<bot|me|guid>]
+
+ItemID 可以在数据库表 `item_template` 中查找。两种写法**不能混用**：第三个参数是数字就走位置式写法，是 `键=值` 就走选项式写法。
+
+**所有价格都是单价（单个物品）**：实际挂单价 = 单价 × `stack`，并封顶在最大金币上限。这一点对两种写法都成立。
+
+位置式（原有写法，保持不变）：
 
 * `house` - `2` = 联盟，`6` = 部落，`7` = 中立
 * `item` - 一个 id，或多个用逗号分隔的 id（每条命令最多 200 个）
@@ -71,9 +77,18 @@ ItemID 可以在数据库表 `item_template` 中查找。
 * `hours` - 可选，默认 48，范围 1..720
 * `owner` - 可选：`bot`（默认）、`me`，或角色 guid
 
-**起拍价。** 起拍价为 0 的上架可以被 1 铜币拿走：核心只拒绝低于 `auction->startbid` 的出价，而 1 铜币永远不低于 0。因此本命令用与自动卖家完全相同的规则从买断价推导起拍价——`买断价 * (1 - Auctionator.Seller.BidStartModifier)`，且至少为 1——在默认 `0.3` 下，10000 铜币的上架起拍价为 7000。如果希望 GM 上架只能买断（起拍价等于买断价，出价与买断同价），把 `Auctionator.Seller.BidStartModifier` 设为 `0`。
+选项式（显式指定这一条上架的模式与价格，**覆盖** `Auctionator.Seller.BidOnly`，只影响这一条命令）：
 
-**纯拍卖（不设一口价）。** 把 `Auctionator.Seller.BidOnly` 设为 `1` 后，模块创建的条目完全不设一口价（自动卖家与两条 GM 命令都生效）：上面的价格直接成为**起拍价**（`.auctionator add` 为 `<price> * stack`），条目只能靠竞标成交。核心把 buyout 0 当作"没有一口价"——这正是玩家留空一口价上架时发送的值——所以不涉及任何核心改动。此模式下 `BidStartModifier` 被忽略。无人出价的纯拍卖条目照常过期，物品与其它流拍一样被回收删除。
+* `mode=buyout` - **一口价**：只填 `buyout`，起拍价被钉在买断价上，谁都无法用低价竞拍。
+* `mode=bid` - **竞拍**：`bid`（起拍单价）必填，`buyout`（买断单价）可选；填了买断价就必须不低于起拍价。
+* `mode` 可以省略，由 `bid=` / `buyout=` 推断。
+* `stack=` / `hours=` / `owner=` 含义与位置式相同。
+
+位置式与选项式都不接受起拍价 0，原因见下。
+
+**起拍价。** 起拍价为 0 的上架可以被 1 铜币拿走：核心只拒绝低于 `auction->startbid` 的出价，而 1 铜币永远不低于 0。因此位置式写法用与自动卖家完全相同的规则从买断价推导起拍价——`买断价 * (1 - Auctionator.Seller.BidStartModifier)`，且至少为 1——在默认 `0.3` 下，10000 铜币的上架起拍价为 7000。选项式写法下起拍价由 GM 直接决定（`mode=bid` 的 `bid`），`mode=buyout` 则把起拍价钉在买断价上，效果等同于把 `BidStartModifier` 设为 `0`。
+
+**纯拍卖（不设一口价）。** 把 `Auctionator.Seller.BidOnly` 设为 `1` 后，模块创建的条目完全不设一口价（自动卖家与两条 GM 命令都生效）：上面的价格直接成为**起拍价**（`.auctionator add` 为 `<price> * stack`），条目只能靠竞标成交。核心把 buyout 0 当作"没有一口价"——这正是玩家留空一口价上架时发送的值——所以不涉及任何核心改动。此模式下 `BidStartModifier` 被忽略。无人出价的纯拍卖条目照常过期，物品与其它流拍一样被回收删除。`BidOnly` 现在只作用于**自动卖家**与**位置式 `.auctionator add`**；选项式写法与 `mod_auctionator_gm_list` 中显式写了 `mode` 的行都会覆盖它，所以不必再为了上架一件纯拍卖物品而改动全区配置。
 
 **金币处理。** 使用默认 owner（`bot`，即配置的 `Auctionator.CharacterGuid`）时，销售所得会邮寄给拍卖机器人角色，并由邮件脚本回收：金币离开经济系统。如果无人购买，该上架的**物品**同样会被回收，因此流拍也不会留下死邮件。传入 `me` 或角色 guid 可以让金币到达真实角色。
 
@@ -97,12 +112,38 @@ ItemID 可以在数据库表 `item_template` 中查找。
 .auctionator add 7 19019 500000 1 72 me
 ```
 
+显式一口价 1 金币（无法低价竞拍），金币被回收：
+
+```
+.auctionator add 7 5500 mode=buyout buyout=10000
+```
+
+竞拍：起拍单价 5 银币，买断单价 1 金币，20 个一组，持续 12 小时：
+
+```
+.auctionator add 6 4359 mode=bid bid=500 buyout=10000 stack=20 hours=12 owner=bot
+```
+
+纯竞拍（不设一口价），起拍单价 5 银币：
+
+```
+.auctionator add 7 4359 mode=bid bid=500
+```
+
 ### auctionator addlist [house] [owner]
 
 列出 `mod_auctionator_gm_list`（world 数据库）中所有启用的行，这样可以用一条命令补货一组精选的特殊物品。可选的 `house` 和 `owner` 参数会覆盖每行的列值。
 
+每行自己的定价由该行的 `mode` 列决定：
+
+* `legacy` - **默认值**，跟随全区的 `Auctionator.Seller.BidOnly` / `BidStartModifier`，即 `mode` 列出现之前所有行的行为。升级不会改变已有行的含义。
+* `buyout` - 一口价：`price` 是买断单价，起拍价被钉在买断价上。
+* `bid` - 竞拍：`bid` 是起拍单价（必填），`price` 是可选的买断单价（0 = 不设），填了就不能低于起拍价。
+
+`price` 与 `bid` 都是**单价（铜/个）**，实际挂单价 = 单价 × `stack`。示例见 `data/sql/db-world/base/mod_auctionator_gm_list.sql`。
+
 ```
-.auctionator addlist          # 使用每行自己的 house/owner
+.auctionator addlist          # 使用每行自己的 house/owner 与 mode
 .auctionator addlist 7        # 强制使用中立拍卖行
 .auctionator addlist 7 me     # 中立拍卖行，金币归你
 ```

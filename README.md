@@ -118,7 +118,16 @@ unknown subcommand answers with an explicit error instead of doing nothing.
 
 ### auctionator add <house> <item[,item...]> <price> [stack] [hours] [owner]
 
-ItemID can be looked up in the database table `item_template`.
+### auctionator add <house> <item[,item...]> mode=<buyout|bid> [bid=<copper>] [buyout=<copper>] [stack=<n>] [hours=<n>] [owner=<bot|me|guid>]
+
+ItemID can be looked up in the database table `item_template`. The two forms are
+**never mixed** inside one command: a number in the price position selects the positional
+form, a `key=value` token there selects the option form.
+
+**Every price is per single item**: the listing price is the unit price times the `stack`,
+capped at the maximum money amount. That holds for both forms.
+
+Positional form (the original one, unchanged):
 
 * `house` - `2` = alliance, `6` = horde, `7` = neutral
 * `item` - one id, or several separated by commas (max 200 per command)
@@ -127,13 +136,25 @@ ItemID can be looked up in the database table `item_template`.
 * `hours` - optional, default 48, range 1..720
 * `owner` - optional: `bot` (default), `me`, or a character guid
 
+Option form (states this one listing's mode and prices explicitly, **overriding**
+`Auctionator.Seller.BidOnly` for this command only):
+
+* `mode=buyout` - **one fixed price**: only `buyout` is needed, and the start bid is
+  pinned to the buyout so nobody can win the stack with a low bid.
+* `mode=bid` - **auction**: `bid` (the unit start bid) is required and `buyout` is
+  optional; when given it may not be below the start bid.
+* `mode` may be left out and is then inferred from `bid=` / `buyout=`.
+* `stack=` / `hours=` / `owner=` mean the same as in the positional form.
+
+Neither form accepts a start bid of 0, for the reason below.
+
 **Start bid.** A listing with a start bid of 0 can be taken for 1 copper: the core only
-rejects a bid below `auction->startbid`, and 1 copper is never below 0. The command
-therefore derives the start bid from the buyout with the same rule as the automatic
+rejects a bid below `auction->startbid`, and 1 copper is never below 0. The positional
+form therefore derives the start bid from the buyout with the same rule as the automatic
 seller - `buyout * (1 - Auctionator.Seller.BidStartModifier)`, never below 1 - so with the
-shipped `0.3` a 10000 copper listing starts bidding at 7000. Set
-`Auctionator.Seller.BidStartModifier = 0` if GM listings should be buyout-only (the start
-bid then equals the buyout, so a bid costs the same as buying it out).
+shipped `0.3` a 10000 copper listing starts bidding at 7000. The option form puts the
+start bid in the GM's hands instead: `mode=bid` uses `bid` as given, and `mode=buyout`
+pins it to the buyout, which is what setting `BidStartModifier = 0` used to achieve.
 
 **Bid-only listings.** With `Auctionator.Seller.BidOnly = 1` the module creates no buyout at
 all (the automatic seller and both GM commands): the price above becomes the *start bid*
@@ -141,7 +162,10 @@ all (the automatic seller and both GM commands): the price above becomes the *st
 core treats buyout 0 as "no buyout", which is exactly what a player listing with an empty
 buyout sends, so no core change is involved. `BidStartModifier` is ignored in this mode.
 A bid-only entry that nobody bids on still expires and its item is recycled like any other
-unsold listing.
+unsold listing. `BidOnly` now only governs the **automatic seller** and the **positional**
+`.auctionator add` form: the option form and any `mod_auctionator_gm_list` row whose `mode`
+is not `legacy` override it, so listing a single item as an auction no longer means changing
+a realm-wide setting.
 
 **Gold handling.** With the default owner (`bot`, i.e. the configured
 `Auctionator.CharacterGuid`) the sale money is mailed to the auctionator
@@ -173,11 +197,42 @@ List a bind-on-pickup epic for yourself, 3 day duration, money to your character
 .auctionator add 7 19019 500000 1 72 me
 ```
 
+List the pearl at an explicit fixed 1 gold price that cannot be underbid, gold recycled:
+
+```
+.auctionator add 7 5500 mode=buyout buyout=10000
+```
+
+Auction 20 Copper Bolts with a 5 silver start bid and a 1 gold buyout, for 12 hours:
+
+```
+.auctionator add 6 4359 mode=bid bid=500 buyout=10000 stack=20 hours=12 owner=bot
+```
+
+A pure auction (no buyout at all) starting at 5 silver:
+
+```
+.auctionator add 7 4359 mode=bid bid=500
+```
+
 ### auctionator addlist [house] [owner]
 
 Lists every enabled row of `mod_auctionator_gm_list` (world database) so a
 curated set of special items can be restocked with one command. The optional
 `house` and `owner` arguments override the per-row columns.
+
+How a row is priced comes from its own `mode` column:
+
+* `legacy` - the **default**, follows the realm-wide `Auctionator.Seller.BidOnly` /
+  `BidStartModifier` pair, i.e. the behaviour every row had before the column existed.
+  Upgrading therefore never changes what an existing row means.
+* `buyout` - one fixed price: `price` is the unit buyout and the start bid is pinned to it.
+* `bid` - auction: `bid` is the unit start bid (required) and `price` is the optional unit
+  buyout (0 = none), which may not be below the start bid.
+
+`price` and `bid` are both **unit** prices in copper (per single item), so the listing
+price is the unit price times `stack`. See
+`data/sql/db-world/base/mod_auctionator_gm_list.sql` for example rows.
 
 ```
 .auctionator addlist          # use each row's own house/owner

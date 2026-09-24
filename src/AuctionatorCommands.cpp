@@ -61,6 +61,132 @@ namespace
         }
     }
 
+    // How a GM listing prices its start bid and its buyout.
+    enum class ListingMode
+    {
+        // Follow the realm-wide Auctionator.Seller.BidOnly / BidStartModifier pair: the
+        // price is a buyout with a discounted start bid, or a pure-auction start bid.
+        // This is what ".auctionator add" did before mode= existed and what rows of
+        // mod_auctionator_gm_list migrated from that era still ask for, so an existing
+        // roster keeps behaving exactly as it used to.
+        Legacy,
+        // One fixed price: the buyer pays the buyout. The start bid is forced to the
+        // buyout so nobody can open a 1-copper bid and sit on it until expiry.
+        Buyout,
+        // Auction: the GM's start bid is authoritative and the buyout is optional
+        // (0 = no buyout, the item sells to the highest bidder).
+        Bid,
+    };
+
+    // Unit prices in copper, i.e. per single item. AddSingleListing multiplies them by
+    // the (clamped) stack and caps the result at MAX_MONEY_AMOUNT.
+    struct ListingPricing
+    {
+        ListingMode mode = ListingMode::Legacy;
+        uint32 unitBid = 0;
+        uint32 unitBuyout = 0;
+    };
+
+    // Splits "mode=bid" into "mode" and "bid". Empty keys and empty values are rejected
+    // so "=x" and "mode=" cannot silently mean something.
+    bool SplitOption(std::string const& token, std::string& key, std::string& value)
+    {
+        size_t const separator = token.find('=');
+        if (separator == std::string::npos || separator == 0 || separator + 1 >= token.size())
+        {
+            return false;
+        }
+
+        key = token.substr(0, separator);
+        value = token.substr(separator + 1);
+        return true;
+    }
+
+    // Validates an explicit mode/bid/buyout combination. Prices are UNIT copper.
+    // Returns false after printing a GM-readable reason.
+    bool ResolveExplicitPricing(std::string const& mode, bool hasBid, uint32 unitBid,
+        bool hasBuyout, uint32 unitBuyout, ChatHandler* handler, ListingPricing& pricing)
+    {
+        std::string resolved = mode;
+
+        if (resolved.empty())
+        {
+            // No mode=: infer it from whichever price was given, so "bid=500" and
+            // "buyout=5000" both work on their own. bid wins when both are present,
+            // because that is the more specific of the two.
+            if (hasBid && unitBid > 0)
+            {
+                resolved = "bid";
+            }
+            else if (hasBuyout && unitBuyout > 0)
+            {
+                resolved = "buyout";
+            }
+        }
+
+        if (resolved == "buyout")
+        {
+            if (!hasBuyout || unitBuyout == 0)
+            {
+                handler->SendSysMessage("[Auctionator] add: mode=buyout needs buyout=<copper per item> above 0.");
+                return false;
+            }
+
+            if (hasBid && unitBid != 0)
+            {
+                handler->SendSysMessage("[Auctionator] add: mode=buyout takes no start bid: the start bid is the "
+                    "buyout, otherwise the stack could be won with a fraction of the price. Use mode=bid instead.");
+                return false;
+            }
+
+            pricing.mode = ListingMode::Buyout;
+            pricing.unitBuyout = unitBuyout;
+            return true;
+        }
+
+        if (resolved == "bid")
+        {
+            if (!hasBid || unitBid == 0)
+            {
+                handler->SendSysMessage("[Auctionator] add: mode=bid needs bid=<copper per item> above 0.");
+                return false;
+            }
+
+            if (hasBuyout && unitBuyout != 0 && unitBuyout < unitBid)
+            {
+                handler->SendSysMessage("[Auctionator] add: buyout (" + std::to_string(unitBuyout)
+                    + ") must not be below the start bid (" + std::to_string(unitBid) + ").");
+                return false;
+            }
+
+            pricing.mode = ListingMode::Bid;
+            pricing.unitBid = unitBid;
+            pricing.unitBuyout = hasBuyout ? unitBuyout : 0;
+            return true;
+        }
+
+        handler->SendSysMessage("[Auctionator] add: mode must be \"buyout\" (one fixed price) or \"bid\" "
+            "(auction)" + std::string(mode.empty() ? ", and no bid=/buyout= price was given either." : "."));
+        return false;
+    }
+
+    // Map a mod_auctionator_gm_list.mode value onto a ListingMode. Unknown or empty
+    // values fall back to Legacy, which is the column's default.
+    ListingMode ListingModeFromColumn(std::string const& value)
+    {
+        if (value == "buyout")
+        {
+            return ListingMode::Buyout;
+        }
+
+        if (value == "bid")
+        {
+            return ListingMode::Bid;
+        }
+
+        return ListingMode::Legacy;
+    }
+
     // Split "5500, 5501,5502" into its non-empty tokens (spaces are ignored).
     std::vector<std::string> SplitList(std::string const& value, char separator)
     {
@@ -284,8 +410,12 @@ class AuctionatorCommands : public CommandScript
         }
 
         // Creates one listing. Returns true only when the auction really exists.
-        static bool AddSingleListing(uint32 auctionHouseId, uint32 itemId, uint32 unitPrice, uint32 stackSize,
-            uint32 hours, uint32 ownerGuid, ChatHandler* handler, Auctionator* auctionator, bool report)
+        //
+        // pricing holds UNIT copper prices; the stack multiplication and the
+        // MAX_MONEY_AMOUNT cap happen here so no caller has to think about them.
+        static bool AddSingleListing(uint32 auctionHouseId, uint32 itemId, ListingPricing const& pricing,
+            uint32 stackSize, uint32 hours, uint32 ownerGuid, ChatHandler* handler, Auctionator* auctionator,
+            bool report)
         {
             ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
             if (!proto)
@@ -316,44 +446,83 @@ class AuctionatorCommands : public CommandScript
                     + std::to_string(itemId) + "]: " + notes);
             }
 
-            uint64 const totalPrice = static_cast<uint64>(unitPrice) * static_cast<uint64>(finalStack);
-            if (report && totalPrice > MAX_MONEY_AMOUNT)
+            // Total copper for a unit price. The product is capped at MAX_MONEY_AMOUNT
+            // instead of wrapping around, exactly like the original single-price path.
+            auto const totalOf = [finalStack](uint32 unitPrice) -> uint32
             {
-                handler->SendSysMessage("[Auctionator] add: " + proto->Name1 + " [" + std::to_string(itemId)
-                    + "] stack total exceeds the maximum money amount, capping the listing price at "
-                    + std::to_string(MAX_MONEY_AMOUNT) + " copper.");
-            }
+                return static_cast<uint32>(std::min<uint64>(
+                    static_cast<uint64>(unitPrice) * static_cast<uint64>(finalStack), MAX_MONEY_AMOUNT));
+            };
 
-            uint32 const cappedTotal = static_cast<uint32>(std::min<uint64>(totalPrice, MAX_MONEY_AMOUNT));
+            if (report)
+            {
+                uint64 const requested = static_cast<uint64>(std::max(pricing.unitBid, pricing.unitBuyout))
+                    * static_cast<uint64>(finalStack);
+                if (requested > MAX_MONEY_AMOUNT)
+                {
+                    handler->SendSysMessage("[Auctionator] add: " + proto->Name1 + " [" + std::to_string(itemId)
+                        + "] stack total exceeds the maximum money amount, capping the listing price at "
+                        + std::to_string(MAX_MONEY_AMOUNT) + " copper.");
+                }
+            }
 
             AuctionatorItem newItem;
             newItem.houseId = auctionHouseId;
             newItem.itemId = itemId;
 
-            if (auctionator->config->sellerConfig.bidOnly)
+            switch (pricing.mode)
             {
-                //
-                // Pure auction (Auctionator.Seller.BidOnly = 1): no buyout, so the whole
-                // price becomes the start bid. The GM still passes a *unit* price; it is
-                // multiplied by the stack exactly like the buyout would have been.
-                //
-                newItem.buyout = 0;
-                newItem.bid = cappedTotal;
-            }
-            else
-            {
-                newItem.buyout = cappedTotal;
+                case ListingMode::Buyout:
+                    //
+                    // One fixed price. The start bid equals the buyout on purpose: the core
+                    // only rejects a bid below auction->startbid, so a start bid of 0 (or a
+                    // discounted one) would let a player take the whole stack for a fraction
+                    // of the price when the auction expires.
+                    //
+                    newItem.buyout = totalOf(pricing.unitBuyout);
+                    newItem.bid = newItem.buyout;
+                    break;
 
-                //
-                // A start bid of 0 means "any bid wins" to the core: HandleAuctionPlaceBid only
-                // rejects a bid below auction->startbid, so a 0 would let a player take the stack
-                // (including a 500000 copper epic) for 1 copper when the auction expires. Use the
-                // same rule as the automatic seller: buyout * (1 - BidStartModifier), never below 1.
-                //
-                float const bidStartModifier = std::clamp(auctionator->config->sellerConfig.bidStartModifier, 0.0f, 1.0f);
-                uint64 const startBid = static_cast<uint64>(std::llround(
-                    static_cast<double>(newItem.buyout) * (1.0 - static_cast<double>(bidStartModifier))));
-                newItem.bid = static_cast<uint32>(std::min<uint64>(std::max<uint64>(1, startBid), newItem.buyout));
+                case ListingMode::Bid:
+                    // Auction: the GM's start bid is used as given, the buyout is optional.
+                    newItem.bid = totalOf(pricing.unitBid);
+                    newItem.buyout = pricing.unitBuyout == 0 ? 0 : totalOf(pricing.unitBuyout);
+                    break;
+
+                case ListingMode::Legacy:
+                default:
+                {
+                    uint32 const cappedTotal = totalOf(pricing.unitBuyout);
+
+                    if (auctionator->config->sellerConfig.bidOnly)
+                    {
+                        //
+                        // Pure auction (Auctionator.Seller.BidOnly = 1): no buyout, so the whole
+                        // price becomes the start bid. The GM still passes a *unit* price; it is
+                        // multiplied by the stack exactly like the buyout would have been.
+                        //
+                        newItem.buyout = 0;
+                        newItem.bid = cappedTotal;
+                    }
+                    else
+                    {
+                        newItem.buyout = cappedTotal;
+
+                        //
+                        // A start bid of 0 means "any bid wins" to the core: HandleAuctionPlaceBid only
+                        // rejects a bid below auction->startbid, so a 0 would let a player take the stack
+                        // (including a 500000 copper epic) for 1 copper when the auction expires. Use the
+                        // same rule as the automatic seller: buyout * (1 - BidStartModifier), never below 1.
+                        //
+                        float const bidStartModifier =
+                            std::clamp(auctionator->config->sellerConfig.bidStartModifier, 0.0f, 1.0f);
+                        uint64 const startBid = static_cast<uint64>(std::llround(
+                            static_cast<double>(newItem.buyout) * (1.0 - static_cast<double>(bidStartModifier))));
+                        newItem.bid = static_cast<uint32>(
+                            std::min<uint64>(std::max<uint64>(1, startBid), newItem.buyout));
+                    }
+                    break;
+                }
             }
 
             newItem.stackSize = finalStack;
@@ -423,19 +592,33 @@ class AuctionatorCommands : public CommandScript
         }
 
         // .auctionator add <house> <item[,item...]> <price> [stack] [hours] [owner]
+        // .auctionator add <house> <item[,item...]> mode=<buyout|bid> [bid=<copper>] [buyout=<copper>]
+        //                                           [stack=<n>] [hours=<n>] [owner=<bot|me|guid>]
         //
-        // <price> is the unit price; the buyout becomes price * stack.
+        // Two forms, never mixed inside one command:
+        //
+        //   positional : <price> is a UNIT price, so the listing price becomes price * stack,
+        //                and Auctionator.Seller.BidOnly decides what that price means (a
+        //                buyout with a BidStartModifier start bid, or a pure auction). This
+        //                is the original form, kept so existing macros keep working.
+        //
+        //   options    : every price is named and given per unit. mode=buyout is one fixed
+        //                price that the start bid is pinned to; mode=bid is an auction with
+        //                an explicit start bid and an optional buyout. The options override
+        //                Auctionator.Seller.BidOnly for this listing only.
+        //
         // No owner (or "bot") means the sale money is recycled by the system.
         static bool CommandAdd(std::vector<std::string> const& params, ChatHandler* handler, Auctionator* auctionator)
         {
-            if (params.size() < 3 || params.size() > 6)
+            if (params.size() < 3)
             {
-                handler->SendSysMessage("[Auctionator] add: usage <house> <item[,item...]> <price> [stack] [hours] [owner]");
+                handler->SendSysMessage("[Auctionator] add: usage <house> <item[,item...]> <price> [stack] [hours] "
+                    "[owner] | <house> <item[,item...]> mode=<buyout|bid> [bid=<copper>] [buyout=<copper>] "
+                    "[stack=<n>] [hours=<n>] [owner=<bot|me|guid>]");
                 return true;
             }
 
             uint32 auctionHouseId = 0;
-            uint32 unitPrice = 0;
 
             if (!TryParseUInt32(params[0], auctionHouseId))
             {
@@ -472,10 +655,153 @@ class AuctionatorCommands : public CommandScript
                 return true;
             }
 
-            if (!TryParseUInt32(params[2], unitPrice) || unitPrice == 0 || unitPrice > MAX_MONEY_AMOUNT)
+            // A "key=value" token where the price would be selects the option form; a plain
+            // number keeps the positional form. A price can never contain '=', so the two
+            // forms can never be confused, and they are never mixed inside one command.
+            bool const optionForm = params[2].find('=') != std::string::npos;
+
+            ListingPricing pricing;
+            uint32 stackSize = 1;
+            uint32 hours = DefaultListingHours;
+            uint32 ownerGuid = 0;
+
+            if (optionForm)
             {
-                handler->SendSysMessage("[Auctionator] add: price must be between 1 and "
-                    + std::to_string(MAX_MONEY_AMOUNT) + " copper per item.");
+                std::string mode;
+                bool hasBid = false;
+                bool hasBuyout = false;
+                uint32 optionBid = 0;
+                uint32 optionBuyout = 0;
+
+                for (size_t i = 2; i < params.size(); ++i)
+                {
+                    std::string key;
+                    std::string value;
+                    if (!SplitOption(params[i], key, value))
+                    {
+                        handler->SendSysMessage("[Auctionator] add: \"" + params[i] + "\" is not a key=value "
+                            "option; the option form takes mode=, bid=, buyout=, stack=, hours= and owner=.");
+                        return true;
+                    }
+
+                    if (key == "mode")
+                    {
+                        mode = value;
+                    }
+                    else if (key == "bid")
+                    {
+                        if (!TryParseUInt32(value, optionBid))
+                        {
+                            handler->SendSysMessage("[Auctionator] add: bid must be a number of copper per item.");
+                            return true;
+                        }
+                        hasBid = true;
+                    }
+                    else if (key == "buyout")
+                    {
+                        if (!TryParseUInt32(value, optionBuyout))
+                        {
+                            handler->SendSysMessage("[Auctionator] add: buyout must be a number of copper per item.");
+                            return true;
+                        }
+                        hasBuyout = true;
+                    }
+                    else if (key == "stack")
+                    {
+                        if (!TryParseUInt32(value, stackSize))
+                        {
+                            handler->SendSysMessage("[Auctionator] add: stack must be a number.");
+                            return true;
+                        }
+                    }
+                    else if (key == "hours")
+                    {
+                        if (!TryParseUInt32(value, hours))
+                        {
+                            handler->SendSysMessage("[Auctionator] add: hours must be a number.");
+                            return true;
+                        }
+                    }
+                    else if (key == "owner")
+                    {
+                        if (!ResolveOwnerArgument(value, handler, ownerGuid))
+                        {
+                            return true;
+                        }
+                    }
+                    else
+                    {
+                        handler->SendSysMessage("[Auctionator] add: unknown option \"" + key + "\"; the option form "
+                            "takes mode=, bid=, buyout=, stack=, hours= and owner=.");
+                        return true;
+                    }
+                }
+
+                if (hasBid && optionBid > MAX_MONEY_AMOUNT)
+                {
+                    handler->SendSysMessage("[Auctionator] add: bid must be at most "
+                        + std::to_string(MAX_MONEY_AMOUNT) + " copper per item.");
+                    return true;
+                }
+
+                if (hasBuyout && optionBuyout > MAX_MONEY_AMOUNT)
+                {
+                    handler->SendSysMessage("[Auctionator] add: buyout must be at most "
+                        + std::to_string(MAX_MONEY_AMOUNT) + " copper per item.");
+                    return true;
+                }
+
+                if (!ResolveExplicitPricing(mode, hasBid, optionBid, hasBuyout, optionBuyout, handler, pricing))
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                if (params.size() > 6)
+                {
+                    handler->SendSysMessage("[Auctionator] add: usage <house> <item[,item...]> <price> [stack] "
+                        "[hours] [owner] | <house> <item[,item...]> mode=<buyout|bid> [bid=<copper>] "
+                        "[buyout=<copper>] [stack=<n>] [hours=<n>] [owner=<bot|me|guid>]");
+                    return true;
+                }
+
+                uint32 unitPrice = 0;
+                if (!TryParseUInt32(params[2], unitPrice) || unitPrice == 0 || unitPrice > MAX_MONEY_AMOUNT)
+                {
+                    handler->SendSysMessage("[Auctionator] add: price must be between 1 and "
+                        + std::to_string(MAX_MONEY_AMOUNT) + " copper per item.");
+                    return true;
+                }
+
+                if (params.size() >= 4 && !TryParseUInt32(params[3], stackSize))
+                {
+                    handler->SendSysMessage("[Auctionator] add: stack must be a number.");
+                    return true;
+                }
+
+                if (params.size() >= 5 && !TryParseUInt32(params[4], hours))
+                {
+                    handler->SendSysMessage("[Auctionator] add: hours must be a number.");
+                    return true;
+                }
+
+                if (params.size() >= 6 && !ResolveOwnerArgument(params[5], handler, ownerGuid))
+                {
+                    return true;
+                }
+
+                // The positional form keeps consulting Auctionator.Seller.BidOnly.
+                pricing.mode = ListingMode::Legacy;
+                pricing.unitBuyout = unitPrice;
+            }
+
+            stackSize = std::clamp<uint32>(stackSize, 1, MaxListingStack);
+
+            if (hours < MinListingHours || hours > MaxListingHours)
+            {
+                handler->SendSysMessage("[Auctionator] add: hours must be between "
+                    + std::to_string(MinListingHours) + " and " + std::to_string(MaxListingHours) + ".");
                 return true;
             }
 
@@ -507,39 +833,10 @@ class AuctionatorCommands : public CommandScript
                 itemIds.push_back(itemId);
             }
 
-            uint32 stackSize = 1;
-            if (params.size() >= 4 && !TryParseUInt32(params[3], stackSize))
-            {
-                handler->SendSysMessage("[Auctionator] add: stack must be a number.");
-                return true;
-            }
-
-            stackSize = std::clamp<uint32>(stackSize, 1, MaxListingStack);
-
-            uint32 hours = DefaultListingHours;
-            if (params.size() >= 5 && !TryParseUInt32(params[4], hours))
-            {
-                handler->SendSysMessage("[Auctionator] add: hours must be a number.");
-                return true;
-            }
-
-            if (hours < MinListingHours || hours > MaxListingHours)
-            {
-                handler->SendSysMessage("[Auctionator] add: hours must be between "
-                    + std::to_string(MinListingHours) + " and " + std::to_string(MaxListingHours) + ".");
-                return true;
-            }
-
-            uint32 ownerGuid = 0;
-            if (params.size() >= 6 && !ResolveOwnerArgument(params[5], handler, ownerGuid))
-            {
-                return true;
-            }
-
             uint32 listed = 0;
             for (uint32 itemId : itemIds)
             {
-                if (AddSingleListing(auctionHouseId, itemId, unitPrice, stackSize, hours, ownerGuid, handler, auctionator, true))
+                if (AddSingleListing(auctionHouseId, itemId, pricing, stackSize, hours, ownerGuid, handler, auctionator, true))
                 {
                     listed++;
                 }
@@ -587,7 +884,7 @@ class AuctionatorCommands : public CommandScript
             }
 
             QueryResult result = WorldDatabase.Query(R"(
-                SELECT item, price, stack, hours, house, owner
+                SELECT item, mode, price, bid, stack, hours, house, owner
                 FROM mod_auctionator_gm_list
                 WHERE enabled = 1
                 ORDER BY house, item
@@ -608,11 +905,13 @@ class AuctionatorCommands : public CommandScript
                 Field* fields = result->Fetch();
 
                 uint32 const itemId = fields[0].Get<uint32>();
-                uint32 const unitPrice = fields[1].Get<uint32>();
-                uint32 const stackSize = fields[2].Get<uint32>();
-                uint32 const hours = fields[3].Get<uint32>();
-                uint32 const rowHouse = fields[4].Get<uint32>();
-                uint32 const rowOwner = fields[5].Get<uint32>();
+                std::string const mode = fields[1].Get<std::string>();
+                uint32 const unitBuyout = fields[2].Get<uint32>();
+                uint32 const unitBid = fields[3].Get<uint32>();
+                uint32 const stackSize = fields[4].Get<uint32>();
+                uint32 const hours = fields[5].Get<uint32>();
+                uint32 const rowHouse = fields[6].Get<uint32>();
+                uint32 const rowOwner = fields[7].Get<uint32>();
 
                 processed++;
 
@@ -645,12 +944,47 @@ class AuctionatorCommands : public CommandScript
                     continue;
                 }
 
-                if (unitPrice == 0 || unitPrice > MAX_MONEY_AMOUNT)
+                ListingPricing pricing;
+                pricing.mode = ListingModeFromColumn(mode);
+
+                if (pricing.mode == ListingMode::Bid)
                 {
-                    handler->SendSysMessage("[Auctionator] addlist: skipping item " + std::to_string(itemId)
-                        + " (price must be between 1 and " + std::to_string(MAX_MONEY_AMOUNT) + " copper).");
-                    skipped++;
-                    continue;
+                    // 竞拍 row: the start bid decides the listing, so it is mandatory; the
+                    // buyout is optional (0 = no buyout, the item goes to the top bidder).
+                    if (unitBid == 0 || unitBid > MAX_MONEY_AMOUNT)
+                    {
+                        handler->SendSysMessage("[Auctionator] addlist: skipping item " + std::to_string(itemId)
+                            + " (mode=bid needs bid between 1 and " + std::to_string(MAX_MONEY_AMOUNT)
+                            + " copper per item).");
+                        skipped++;
+                        continue;
+                    }
+
+                    if (unitBuyout > MAX_MONEY_AMOUNT || (unitBuyout != 0 && unitBuyout < unitBid))
+                    {
+                        handler->SendSysMessage("[Auctionator] addlist: skipping item " + std::to_string(itemId)
+                            + " (buyout must be 0 or at least the start bid " + std::to_string(unitBid) + ").");
+                        skipped++;
+                        continue;
+                    }
+
+                    pricing.unitBid = unitBid;
+                    pricing.unitBuyout = unitBuyout;
+                }
+                else
+                {
+                    // 一口价 and legacy rows are both priced by the single "price" column;
+                    // only the start bid rule differs, and AddSingleListing owns that.
+                    if (unitBuyout == 0 || unitBuyout > MAX_MONEY_AMOUNT)
+                    {
+                        handler->SendSysMessage("[Auctionator] addlist: skipping item " + std::to_string(itemId)
+                            + " (price must be between 1 and " + std::to_string(MAX_MONEY_AMOUNT)
+                            + " copper per item).");
+                        skipped++;
+                        continue;
+                    }
+
+                    pricing.unitBuyout = unitBuyout;
                 }
 
                 if (hours < MinListingHours || hours > MaxListingHours)
@@ -671,7 +1005,7 @@ class AuctionatorCommands : public CommandScript
                     continue;
                 }
 
-                if (AddSingleListing(house, itemId, unitPrice, stackSize, hours, owner, handler, auctionator, false))
+                if (AddSingleListing(house, itemId, pricing, stackSize, hours, owner, handler, auctionator, false))
                 {
                     listed++;
                 }
@@ -824,19 +1158,33 @@ class AuctionatorCommands : public CommandScript
             std::string helpString(R"(
 Auctionator Help:
 add <house> <item[,item...]> <price> [stack] [hours] [owner]
+add <house> <item[,item...]> mode=<buyout|bid> [bid=<copper>] [buyout=<copper>]
+                            [stack=<n>] [hours=<n>] [owner=<bot|me|guid>]
      house: 2 = alliance, 6 = horde, 7 = neutral
             (with AllowTwoSide.Interaction.Auction only house 7 is visible to
              players; houses 2 and 6 are refused instead of creating an
              auction nobody can see)
-     price: unit price in copper (buyout = price * stack)
-     start bid: buyout * (1 - Auctionator.Seller.BidStartModifier), at least 1
-            (with Auctionator.Seller.BidOnly = 1 there is no buyout at all: the
-             listing can only be won by bidding and "price * stack" is the start bid)
+     Every price is per single item: the listing price is the unit price times
+     the stack, capped at the maximum money amount. The two forms are never
+     mixed in one command.
+     Positional form: <price> is the unit price and Auctionator.Seller.BidOnly
+     decides what it means:
+       BidOnly = 0: buyout = price * stack, start bid = buyout *
+                    (1 - Auctionator.Seller.BidStartModifier), at least 1
+       BidOnly = 1: no buyout at all, "price * stack" is the start bid
+     Option form (overrides Auctionator.Seller.BidOnly for this listing):
+       mode=buyout buyout=<copper>: one fixed price. The start bid is pinned to
+                    the buyout so nobody can win the stack with a low bid that
+                    then expires.
+       mode=bid    bid=<copper> [buyout=<copper>]: auction. The start bid is
+                    required; the buyout is optional and may not be below it.
+       mode= is inferred from bid=/buyout= when it is left out.
      stack: default 1, capped by the item's max stack
      hours: default 48, range 1..720
      owner: "bot" (default) recycles the sale money, "me" or a character guid
 addlist [house] [owner]
-     lists every enabled row of mod_auctionator_gm_list
+     lists every enabled row of mod_auctionator_gm_list, honouring each row's
+     mode (legacy / buyout / bid), price, bid, stack, hours and owner
 market
      market price table: rows, distinct items, usable scans, import config
 marketimport [force]

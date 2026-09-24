@@ -186,6 +186,15 @@ Auctionator.Seller.BidStartModifier = .3
 # Auctionator.Seller.BidStartModifier is ignored while this is 1: there is no buyout to
 # discount from, and a random discount would only lower the reserve price.
 #
+# This switch is no longer the only way to control a listing's shape. It always applies
+# to the automatic seller and to the positional ".auctionator add" form, but a listing
+# can override it for itself:
+#   * ".auctionator add ... mode=buyout|bid bid=.. buyout=.." prices that one listing
+#     explicitly (see ".auctionator help");
+#   * a mod_auctionator_gm_list row with mode = 'buyout' or 'bid' overrides it for that
+#     row only. Rows still on the default mode = 'legacy' follow this switch, which is
+#     what every row did before the column existed.
+#
 # Notes:
 #   * The core fully supports buyout 0 (it is what a player listing with an empty
 #     buyout sends), so nothing else has to change.
@@ -193,6 +202,9 @@ Auctionator.Seller.BidStartModifier = .3
 #     like an unsold buyout listing.
 #   * A single bid wins at the start-bid price, so keep the price floor in mind
 #     (Auctionator.Seller.MinPriceModifier) when running in this mode.
+#   * A start bid of 0 is never generated: HandleAuctionPlaceBid accepts any bid at or
+#     above the start bid, so a 0 would let a player win the stack with a 1-copper bid
+#     and let it expire. mode = 'buyout' therefore pins the start bid to the buyout.
 ########################################
 Auctionator.Seller.BidOnly = 0
 
