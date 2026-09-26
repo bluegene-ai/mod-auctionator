@@ -327,6 +327,22 @@ class AuctionatorCommands : public CommandScript
                 return CommandExpireAll(commandParams, handler, auctionator);
             }
 
+            // Per-listing management of the auctions the bot already has in the house. These
+            // exist because the `auctionhouse` table is only a startup cache: the live state
+            // is the AuctionHouseMgr's in-memory map, so a panel that edited the row directly
+            // would be silently reverted, and a panel that edited the price would be ignored
+            // by the searcher (players kept seeing the old price). Both go through the live
+            // AuctionEntry instead.
+            if (command == "delist")
+            {
+                return CommandDelist(commandParams, handler, auctionator);
+            }
+
+            if (command == "reprice")
+            {
+                return CommandReprice(commandParams, handler, auctionator);
+            }
+
             if (command == "multiplier")
             {
                 return CommandSetMultiplier(commandParams, handler, auctionator);
@@ -1286,6 +1302,16 @@ stop | off
 expireall <house> [all]
      without "all" only the auctionator's own auctions are expired; listings
      created with an explicit owner need "all"
+delist <auctionId> [all]
+     take ONE auction down by id (the panel's listing table shows the id). The
+     item is mailed back to the owner on the next auction house tick. Refused
+     for an auction that already has a bid, and without "all" for one the
+     auctionator does not own.
+reprice <auctionId> <startbid> <buyout> [all]
+     rewrite the two prices of ONE auction, in TOTAL copper (both are shown
+     per row by the panel, unlike "add", whose prices are per item).
+     buyout 0 = no buyout (pure auction); otherwise it may not be below the
+     start bid. Applies to players immediately. Same "all" rule as delist.
 multiplier <seller|bidder> <poor|normal|uncommon|rare|epic|legendary> <value>
 status
 help
@@ -1450,6 +1476,122 @@ help
             auctionator->ExpireAllAuctions(houseId, includePlayerAuctions);
 
             auctionator->logInfo("expireall: Done for house: " + std::to_string(houseId));
+
+            return true;
+        }
+
+        // .auctionator delist <auctionId> [all]
+        //
+        // Takes ONE auction down. Unlike expireall this is the targeted version, so it
+        // refuses an auction that already carries a bid (the core's expiry path would settle
+        // it with the bidder, i.e. sell it, which is the opposite of taking it down) and,
+        // without "all", one the auctionator does not own.
+        static bool CommandDelist(std::vector<std::string> const& params, ChatHandler* handler,
+            Auctionator* auctionator)
+        {
+            if (params.empty() || params.size() > 2)
+            {
+                ReplyAcked(handler, false, "[Auctionator] delist: usage <auctionId> [all]");
+                return true;
+            }
+
+            uint32 auctionId = 0;
+            if (!TryParseUInt32(params[0], auctionId) || auctionId == 0)
+            {
+                ReplyAcked(handler, false, "[Auctionator] delist: the auction id must be a number above 0.");
+                return true;
+            }
+
+            bool includePlayerAuctions = false;
+            if (params.size() >= 2)
+            {
+                if (params[1] != "all")
+                {
+                    ReplyAcked(handler, false, "[Auctionator] delist: usage <auctionId> [all]");
+                    return true;
+                }
+
+                includePlayerAuctions = true;
+            }
+
+            std::string error;
+            if (!auctionator->DelistAuction(auctionId, includePlayerAuctions, error))
+            {
+                auctionator->logWarn("delist: refused for auction " + std::to_string(auctionId) + ": " + error);
+                ReplyAcked(handler, false, "[Auctionator] delist: " + error);
+                return true;
+            }
+
+            ReplyAcked(handler, true, "[Auctionator] delist: auction " + std::to_string(auctionId)
+                + " is now cancelled. Its item is mailed back to the owner on the next auction "
+                  "house tick (about a minute); the bot's own mail is recycled, so its stock "
+                  "simply disappears.");
+
+            return true;
+        }
+
+        // .auctionator reprice <auctionId> <startbid> <buyout> [all]
+        //
+        // Both prices are TOTALS in copper - exactly the two values the panel's listing table
+        // shows for that row - unlike ".auctionator add", whose prices are per single item.
+        // buyout 0 means "no buyout" (a pure auction). Both values are required on purpose: a
+        // partial update would silently leave a price the GM meant to change.
+        static bool CommandReprice(std::vector<std::string> const& params, ChatHandler* handler,
+            Auctionator* auctionator)
+        {
+            if (params.size() < 3 || params.size() > 4)
+            {
+                ReplyAcked(handler, false, "[Auctionator] reprice: usage <auctionId> <startbid> <buyout> [all] "
+                    "(both prices are totalled in copper; buyout 0 = no buyout)");
+                return true;
+            }
+
+            uint32 auctionId = 0;
+            uint32 startbid = 0;
+            uint32 buyout = 0;
+
+            if (!TryParseUInt32(params[0], auctionId) || auctionId == 0)
+            {
+                ReplyAcked(handler, false, "[Auctionator] reprice: the auction id must be a number above 0.");
+                return true;
+            }
+
+            if (!TryParseUInt32(params[1], startbid))
+            {
+                ReplyAcked(handler, false, "[Auctionator] reprice: startbid must be a number of copper.");
+                return true;
+            }
+
+            if (!TryParseUInt32(params[2], buyout))
+            {
+                ReplyAcked(handler, false, "[Auctionator] reprice: buyout must be a number of copper (0 = no buyout).");
+                return true;
+            }
+
+            bool includePlayerAuctions = false;
+            if (params.size() == 4)
+            {
+                if (params[3] != "all")
+                {
+                    ReplyAcked(handler, false, "[Auctionator] reprice: usage <auctionId> <startbid> <buyout> [all]");
+                    return true;
+                }
+
+                includePlayerAuctions = true;
+            }
+
+            std::string error;
+            if (!auctionator->RepriceAuction(auctionId, startbid, buyout, includePlayerAuctions, error))
+            {
+                auctionator->logWarn("reprice: refused for auction " + std::to_string(auctionId) + ": " + error);
+                ReplyAcked(handler, false, "[Auctionator] reprice: " + error);
+                return true;
+            }
+
+            ReplyAcked(handler, true, "[Auctionator] reprice: auction " + std::to_string(auctionId)
+                + " now has start bid " + std::to_string(startbid) + " and buyout "
+                + (buyout == 0 ? std::string("none") : std::to_string(buyout) + " copper")
+                + ". Players see the new price immediately.");
 
             return true;
         }

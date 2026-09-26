@@ -5,9 +5,12 @@
 #include "World.h"
 #include "WorldSession.h"
 #include "AuctionHouseMgr.h"
+#include "AuctionHouseSearcher.h"
 #include "DBCStores.h"
 #include "Item.h"
 #include "ObjectMgr.h"
+// MAX_MONEY_AMOUNT, the ceiling RepriceAuction() validates the two prices against.
+#include "Player.h"
 #include "DatabaseEnv.h"
 #include "CharacterCache.h"
 #include "Timer.h"
@@ -706,6 +709,187 @@ void Auctionator::ExpireAllAuctions(uint32 houseId, bool includePlayerAuctions)
 
     logDebug("House auctions expired: " + std::to_string(houseId)
         + " count: " + std::to_string(expiredCount));
+}
+
+AuctionEntry* Auctionator::FindAuction(uint32 auctionId)
+{
+    if (auctionId == 0)
+    {
+        return nullptr;
+    }
+
+    // The houses are separate objects unless CONFIG_ALLOW_TWO_SIDE_INTERACTION_AUCTION
+    // merges them into the neutral one; there this probes the same object three times,
+    // which is only a map lookup. Probing by id in every house is what lets a caller pass
+    // just an auction id without having to know (or trust) which house it lives in.
+    uint32 const houses[] = {
+        (uint32)AuctionHouseId::Alliance,
+        (uint32)AuctionHouseId::Horde,
+        (uint32)AuctionHouseId::Neutral,
+    };
+
+    for (uint32 houseId : houses)
+    {
+        AuctionHouseObject* house = GetAuctionHouse(houseId);
+        if (!house)
+        {
+            continue;
+        }
+
+        AuctionEntry* auction = house->GetAuction(auctionId);
+        if (auction)
+        {
+            return auction;
+        }
+    }
+
+    return nullptr;
+}
+
+// Shared precondition of delist/reprice. Both operate on an auction that other players
+// can still see, so the two rules the core itself applies to a seller are enforced here:
+// only the auctionator's own auctions are touched (unless the GM explicitly overrides it),
+// and an auction that already carries a bid is left alone - the core settles a bid-carrying
+// auction with the bidder, which is the opposite of taking it down.
+static bool CheckAuctionMutable(Auctionator* auctionator, AuctionEntry* auction,
+    bool includePlayerAuctions, std::string& error)
+{
+    ObjectGuid const auctionatorOwner = ObjectGuid::Create<HighGuid::Player>(
+        auctionator->config ? auctionator->config->characterGuid : 0);
+
+    if (!includePlayerAuctions && auction->owner != auctionatorOwner)
+    {
+        error = "auction " + std::to_string(auction->Id) + " is owned by "
+            + auction->owner.ToString() + ", not by the auctionator; pass \"all\" to override.";
+        return false;
+    }
+
+    if (auction->bidder)
+    {
+        error = "auction " + std::to_string(auction->Id) + " already has a bid from "
+            + auction->bidder.ToString() + "; it would have to be settled with that bidder "
+            "instead of cancelled or repriced. Let it expire, or use \"expireall\".";
+        return false;
+    }
+
+    return true;
+}
+
+bool Auctionator::DelistAuction(uint32 auctionId, bool includePlayerAuctions, std::string& error)
+{
+    error.clear();
+
+    AuctionEntry* auction = FindAuction(auctionId);
+    if (!auction)
+    {
+        error = "no live auction with id " + std::to_string(auctionId)
+            + " (it may already have expired or been sold).";
+        return false;
+    }
+
+    if (!CheckAuctionMutable(this, auction, includePlayerAuctions, error))
+    {
+        return false;
+    }
+
+    //
+    // Setting expire_time to 0 hands the entry to the core's own expiry path, which is what
+    // makes this safe: on the next AuctionHouseObject::Update() tick the item is mailed back
+    // to its owner, the in-memory item is dropped and the row is deleted. This is the same
+    // mechanism ".auctionator expireall" uses, so no mail or item bookkeeping is reimplemented
+    // here - and the configured auctionator's auction mail is recycled by the mail script, so
+    // the gold sink keeps holding for the bot's own stock.
+    //
+    // The row's own `time` is zeroed too: that column is what a restart reloads, and without
+    // it a worldserver that went down inside the minute before the next tick would bring the
+    // "delisted" auction back as if nothing had happened.
+    //
+    auction->expire_time = 0;
+    CharacterDatabase.Execute("UPDATE auctionhouse SET time = 0 WHERE id = {}", auctionId);
+
+    logInfo("delist: auction " + std::to_string(auctionId)
+        + " (house " + std::to_string((uint32)auction->houseId)
+        + ", item " + std::to_string(auction->item_template)
+        + " x" + std::to_string(auction->itemCount)
+        + ") queued for expiry; its item goes back to the owner.");
+
+    return true;
+}
+
+bool Auctionator::RepriceAuction(uint32 auctionId, uint32 startbid, uint32 buyout,
+    bool includePlayerAuctions, std::string& error)
+{
+    error.clear();
+
+    if (startbid == 0 || startbid > MAX_MONEY_AMOUNT)
+    {
+        error = "startbid must be between 1 and " + std::to_string(MAX_MONEY_AMOUNT) + " copper.";
+        return false;
+    }
+
+    if (buyout > MAX_MONEY_AMOUNT)
+    {
+        error = "buyout must be between 0 and " + std::to_string(MAX_MONEY_AMOUNT)
+            + " copper (0 = no buyout).";
+        return false;
+    }
+
+    if (buyout != 0 && buyout < startbid)
+    {
+        error = "buyout (" + std::to_string(buyout) + ") must not be below the start bid ("
+            + std::to_string(startbid) + ").";
+        return false;
+    }
+
+    AuctionEntry* auction = FindAuction(auctionId);
+    if (!auction)
+    {
+        error = "no live auction with id " + std::to_string(auctionId)
+            + " (it may already have expired or been sold).";
+        return false;
+    }
+
+    if (!CheckAuctionMutable(this, auction, includePlayerAuctions, error))
+    {
+        return false;
+    }
+
+    uint32 const oldStartbid = auction->startbid;
+    uint32 const oldBuyout = auction->buyout;
+
+    auction->startbid = startbid;
+    auction->buyout = buyout;
+
+    // The row is what the next restart and the panel's listing table read, so it is kept in
+    // step with the in-memory entry instead of being left to the next unrelated save.
+    CharacterDatabase.Execute(
+        "UPDATE auctionhouse SET startbid = {}, buyoutprice = {} WHERE id = {}",
+        startbid, buyout, auctionId);
+
+    //
+    // The searcher holds its own SearchableAuctionEntry per auction and only ever learns
+    // about a change through an explicit update message, so without this the realm would go
+    // on listing - and selling at - the old price while the database already carries the new
+    // one. There is no "update price" message, and AuctionSearchAdd inserts without
+    // overwriting an existing id, so the entry has to be removed and re-added from the
+    // AuctionEntry that was just mutated.
+    //
+    if (sAuctionMgr && sAuctionMgr->GetAuctionHouseSearcher())
+    {
+        sAuctionMgr->GetAuctionHouseSearcher()->RemoveAuction(auction);
+        sAuctionMgr->GetAuctionHouseSearcher()->AddAuction(auction);
+    }
+    else
+    {
+        logWarn("reprice: no auction house searcher available; players keep seeing the old "
+            "price until this realm is restarted.");
+    }
+
+    logInfo("reprice: auction " + std::to_string(auctionId)
+        + " start bid " + std::to_string(oldStartbid) + " -> " + std::to_string(startbid)
+        + ", buyout " + std::to_string(oldBuyout) + " -> " + std::to_string(buyout));
+
+    return true;
 }
 
 float Auctionator::GetQualityMultiplier(AuctionatorPriceMultiplierConfig const& config, uint32 quality)

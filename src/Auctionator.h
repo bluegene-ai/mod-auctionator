@@ -75,6 +75,27 @@ class Auctionator : public AuctionatorBase
         // includePlayerAuctions = false expires only auctions owned by the
         // configured auctionator character; true expires every auction of that house.
         void ExpireAllAuctions(uint32 houseId, bool includePlayerAuctions = false);
+        // Locates one live auction by its id, or nullptr when no such auction is loaded.
+        // Auctions live in the per-house objects and
+        // CONFIG_ALLOW_TWO_SIDE_INTERACTION_AUCTION makes all three of them the same
+        // object, so every house is probed instead of trusting a caller supplied one.
+        AuctionEntry* FindAuction(uint32 auctionId);
+        // Takes one auction down by handing it to the core's own expiry path, which mails
+        // the item back to its owner (the mail script recycles the configured
+        // auctionator's auction mail, so the gold sink still holds) and deletes the row.
+        // Refused when the auction already has a bid, because expiring that one *sells*
+        // it to the bidder instead of cancelling it - the exact opposite of "take it
+        // down" - and when the auctionator does not own it, unless
+        // includePlayerAuctions is set. Returns false and fills `error` when nothing was
+        // delisted, so a caller can report the real outcome instead of a guess.
+        bool DelistAuction(uint32 auctionId, bool includePlayerAuctions, std::string& error);
+        // Rewrites the start bid and the buyout of one live auction, persists them and
+        // refreshes the search index - without that last step a running realm keeps
+        // showing (and selling at) the old price, because the searcher holds its own copy
+        // of every auction. `buyout` of 0 means "no buyout" (pure auction).
+        // Same bid/ownership restrictions as DelistAuction.
+        bool RepriceAuction(uint32 auctionId, uint32 startbid, uint32 buyout,
+            bool includePlayerAuctions, std::string& error);
         AuctionHouseObject* GetAuctionHouse(uint32 houseId);
         // Number of auctions of one house. It counts by AuctionEntry::houseId instead of
         // using the house object's size, because with
