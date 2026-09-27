@@ -3,6 +3,7 @@
 #include "WorldSession.h"
 #include "Log.h"
 #include "Auctionator.h"
+#include "AuctionatorSales.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 
@@ -64,6 +65,15 @@ class AuctionatorHouseScript : public AuctionHouseScript
             if (!auctionator->config || !auction) {
                 return;
             }
+
+            //
+            // Sold. This is the only moment the sale exists: the core deletes the
+            // `auctionhouse` row together with the settlement and writes a `log_money` row
+            // for sales of 500 gold and up only, so without this the sale of a module
+            // listing would be gone for good - including which character bought it and for
+            // how much. The recorder ignores player auctions (see AuctionatorSales).
+            //
+            AuctionatorSales().RecordSale(auction);
 
             //
             // The auctionator character is normally offline, in which case the core takes the

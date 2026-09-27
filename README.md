@@ -50,7 +50,8 @@ This mod is meant to keep a healthy auction house stocked on a low-pop server. I
    * characters database, in this order:
      `data/sql/db-characters/updates/2023_11_12_00_marketprice.sql`,
      `data/sql/db-characters/updates/2026_09_20_00_market_price_history.sql`,
-     `data/sql/db-characters/updates/2026_01_29_00_improve_performance.sql`
+     `data/sql/db-characters/updates/2026_01_29_00_improve_performance.sql`,
+     `data/sql/db-characters/updates/2026_09_27_00_sale_log.sql`
    Verify with `SHOW TABLES LIKE 'mod_auctionator%';` in both databases.
 4. **Create the module configuration.** The build ships
    `modules/mod-auctionator/conf/mod_auctionator.conf.dist`; the server only reads
@@ -576,6 +577,50 @@ export in UTC on a `+08:00` host looks eight hours older than it is.
 Note: the timed import only runs while the module is enabled
 (`Auctionator.Enabled = 1`). Use `.auctionator marketimport` if you need to import
 while it is disabled.
+
+## Sale log
+
+The core keeps no record of a **finished** auction: `characters.auctionhouse` holds the
+live listings only (the row is deleted in the same transaction that pays the seller) and
+the core's own `log_money` row is written for sales of 500 gold and up only. A listing the
+module created therefore left no trace at all once a player won it - and that matters
+here, because the sale gold is swallowed by the mail script (gold sink) and the sale mail
+itself is deleted instead of sent. "Who bought which of the bot's items, and for how
+much" was unanswerable.
+
+`mod_auctionator_sale` (characters database, `2026_09_27_00_sale_log.sql`) is that record.
+The module writes **one row per sold listing it created** - the automatic seller and the
+GM `add` / `addlist` commands - from its "auction successful" hook, which covers both ways
+a listing can sell (a buyout, and a winning bid when it expires):
+
+| Column | Meaning |
+|---|---|
+| `auction_id` | the `auctionhouse.id` the sale came from (that row is gone by now) |
+| `item_entry`, `item_count` | `item_template.entry` and how many were in the stack |
+| `house_id` | `2` alliance, `6` horde, `7` neutral |
+| `seller_guid` | the listing's owner |
+| `seller_is_bot` | `1` when the owner is `Auctionator.CharacterGuid`, i.e. the sale gold left the economy; `0` for a listing with an explicit `owner=` |
+| `buyer_guid` | the winner the core settled with |
+| `price` | what the winner paid for the whole stack, in copper |
+| `startbid`, `buyout`, `deposit` | the listing's prices at the time of the sale |
+| `cut` | the auction house cut the core took out of the price |
+| `is_buyout` | `1` = bought out, `0` = won by bidding (`price` is the winning bid) |
+| `sold_at` | server local time, the same clock as `auctionhouse.time` |
+
+Notes:
+
+* **Player-to-player auctions are not recorded.** Only listings the module created
+  (`deposit = 0` - it never charges one, see the economy section) and listings owned by
+  the configured auctionator character are written.
+* **A listing that expires unsold is not recorded**: it is not a sale. The item is simply
+  recycled with its mail.
+* The table is append-only; the module never updates or deletes rows. Prune it from your
+  own cron when it grows, e.g.
+  `DELETE FROM mod_auctionator_sale WHERE sold_at < NOW() - INTERVAL 180 DAY;`
+* A realm that has not applied the SQL update gets one error line in the worldserver log
+  ("`mod_auctionator_sale` is missing") and keeps working; it just records nothing.
+* The management panel (Acore GM Panel) reads this table for its "sale log" card when that
+  panel version is deployed, so a fresh record shows up there without any further setup.
 
 ## Pricing in one picture
 

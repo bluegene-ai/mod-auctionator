@@ -292,6 +292,64 @@ ORDER BY ah.houseId;
 
 
 -- ---------------------------------------------------------------------------
+-- 10) Sale log: who bought what the module listed, and for how much.
+--
+--     One row per SOLD module listing (the automatic seller plus the GM add /
+--     addlist commands), written by the module's "auction successful" hook at
+--     every price level - unlike the core's own acore_characters.log_money, which
+--     only gets a row for sales of 500 gold and up. Player-to-player auctions are
+--     not recorded. seller_is_bot = 1 means the sale gold left the economy (it was
+--     swallowed by the mail script), is_buyout = 1 means the listing was bought out
+--     rather than won by bidding.
+-- ---------------------------------------------------------------------------
+SELECT
+    s.id
+    , s.sold_at
+    , s.item_entry
+    , it.name AS item_name
+    , s.item_count
+    , s.house_id
+    , s.price
+    , s.is_buyout
+    , s.seller_guid
+    , cs.name AS seller_name
+    , s.seller_is_bot
+    , s.buyer_guid
+    , cb.name AS buyer_name
+    , s.startbid
+    , s.buyout
+    , s.cut
+FROM acore_characters.mod_auctionator_sale s
+LEFT JOIN acore_world.item_template it ON it.entry = s.item_entry
+LEFT JOIN acore_characters.characters cs ON cs.guid = s.seller_guid
+LEFT JOIN acore_characters.characters cb ON cb.guid = s.buyer_guid
+ORDER BY s.sold_at DESC, s.id DESC
+LIMIT 200;
+
+-- Sales summary per day (gold out of the economy, how much of it was bought out)
+SELECT
+    DATE(s.sold_at)                       AS day
+    , COUNT(*)                            AS sales
+    , SUM(s.is_buyout)                    AS buyouts
+    , SUM(s.price)                        AS copper_total
+    , SUM(s.price) / 10000                AS gold_total
+    , COUNT(DISTINCT s.buyer_guid)        AS distinct_buyers
+FROM acore_characters.mod_auctionator_sale s
+WHERE s.seller_is_bot = 1
+GROUP BY DATE(s.sold_at)
+ORDER BY day DESC
+LIMIT 60;
+
+-- The most valuable sales, to spot a mispriced listing
+SELECT s.sold_at, s.item_entry, it.name, s.item_count, s.price, s.is_buyout, cb.name AS buyer
+FROM acore_characters.mod_auctionator_sale s
+LEFT JOIN acore_world.item_template it ON it.entry = s.item_entry
+LEFT JOIN acore_characters.characters cb ON cb.guid = s.buyer_guid
+ORDER BY s.price DESC
+LIMIT 50;
+
+
+-- ---------------------------------------------------------------------------
 -- OPERATING (DESTRUCTIVE) - commented out on purpose, read before uncommenting.
 -- ---------------------------------------------------------------------------
 

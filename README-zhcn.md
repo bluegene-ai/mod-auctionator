@@ -31,7 +31,7 @@
 3. 确保**服务器的 `SourceDirectory` 指向包含 `modules/mod-auctionator/data/sql/` 的源码树**（留空则使用编译时的源码路径）。AzerothCore 更新器会从 `<SourceDirectory>/modules/<module>/data/sql/` 应用模块 SQL；如果该路径不可达，模块的表就永远不会创建，卖家找不到候选物品，市场导入也会失败。
    如果你更愿意手动执行，请针对对应的数据库运行以下 SQL：
    * world 数据库：`data/sql/db-world/base/2023-09-18.sql`、`data/sql/db-world/base/mod_auctionator_gm_list.sql` 和 `data/sql/db-world/base/mod_auctionator_quality_config.sql`
-   * characters 数据库，按以下顺序：`data/sql/db-characters/updates/2023_11_12_00_marketprice.sql`、`data/sql/db-characters/updates/2026_09_20_00_market_price_history.sql`、`data/sql/db-characters/updates/2026_01_29_00_improve_performance.sql`
+   * characters 数据库，按以下顺序：`data/sql/db-characters/updates/2023_11_12_00_marketprice.sql`、`data/sql/db-characters/updates/2026_09_20_00_market_price_history.sql`、`data/sql/db-characters/updates/2026_01_29_00_improve_performance.sql`、`data/sql/db-characters/updates/2026_09_27_00_sale_log.sql`
    在两个数据库中都用 `SHOW TABLES LIKE 'mod_auctionator%';` 验证。
 4. **创建模块配置文件。** 构建会附带 `modules/mod-auctionator/conf/mod_auctionator.conf.dist`；服务器只读取 `configs/modules/mod_auctionator.conf`（没有 `.dist`），而且 Windows 构建不会自动为你复制：
    ```
@@ -378,6 +378,35 @@ Auctionator.MarketData.ScanExcludeSelf = 1
 `scan_datetime` 按**数据库服务器的时区**解释：扫描的年龄由数据库本身计算（`TIMESTAMPDIFF(..., NOW())`），因此只有当 CSV 携带数据库主机的本地时间时，导入器和读取器才会一致。在 `+08:00` 主机上使用 UTC 导出会看起来老了八小时。
 
 注意：定时导入仅在模块启用时（`Auctionator.Enabled = 1`）运行。如果需要在禁用时导入，请使用 `.auctionator marketimport`。
+
+## 成交记录
+
+核心不为**已结束**的拍卖留任何记录：`characters.auctionhouse` 里只有还挂着的条目（结算的那条 SQL 事务会把行删掉），核心自己的 `log_money` 只在成交价 ≥ 500 金时才写一行。所以模块上架的物品一旦被玩家买走就彻底没痕迹了——而这在本模块尤其要紧：成交金币被邮件脚本回收（金币池），连成交邮件本身也是被删掉而不是发出。也就是说"谁买走了机器人的哪件东西、花了多少"本来无从回答。
+
+`mod_auctionator_sale`（characters 库，由 `2026_09_27_00_sale_log.sql` 建立）就是这份记录。模块在"拍卖成功"钩子里为**每一条自己创建的挂单**写一行——自动卖家与 GM 的 `add` / `addlist` 都算；两种成交方式（一口价买走、到期被最高出价买走）都覆盖：
+
+| 列 | 含义 |
+|---|---|
+| `auction_id` | 成交时 `auctionhouse.id`（那一行现在已经不存在了） |
+| `item_entry`、`item_count` | `item_template.entry` 与这一组的数量 |
+| `house_id` | `2` 联盟、`6` 部落、`7` 中立 |
+| `seller_guid` | 挂单所有者 |
+| `seller_is_bot` | 所有者为 `Auctionator.CharacterGuid` 时为 `1`，即这笔金币离开了经济系统；显式 `owner=` 的挂单为 `0` |
+| `buyer_guid` | 核心结算给的买家（获胜出价人） |
+| `price` | 买家为整组支付的铜币数 |
+| `startbid`、`buyout`、`deposit` | 成交时这条挂单的三个价格 |
+| `cut` | 核心从成交价里抽走的拍卖行手续费 |
+| `is_buyout` | `1` = 一口价买走，`0` = 竞拍获胜（此时 `price` 是最高出价） |
+| `sold_at` | 服务器本地时间，与 `auctionhouse.time` 同一时钟 |
+
+几点说明：
+
+* **玩家与玩家之间的拍卖不记录。** 只写模块创建的挂单（`deposit = 0`，模块从不收保管费，见"经济与安全保证"）以及所有者为配置的拍卖机器人角色的挂单。
+* **无人出价而过期的挂单不记录**：那不是成交。物品照旧随过期邮件被回收。
+* 这张表只追加，模块永不更新或删除行。变大后请用自己的 cron 清理，例如
+  `DELETE FROM mod_auctionator_sale WHERE sold_at < NOW() - INTERVAL 180 DAY;`
+* 还没执行这条 SQL 更新的区，worldserver 日志里会出现一行错误（`mod_auctionator_sale` is missing），模块照常工作，只是不记录。
+* 管理面板（Acore GM Panel）在部署了对应版本时会读这张表渲染"成交记录"卡片，不需要额外配置。
 
 ## 一张图看懂定价
 
