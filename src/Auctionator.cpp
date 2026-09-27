@@ -18,6 +18,7 @@
 #include "AuctionatorSeller.h"
 #include "AuctionatorBidder.h"
 #include "AuctionatorEvents.h"
+#include "AuctionatorSales.h"
 #include <algorithm>
 #include <ctime>
 #include <string>
@@ -267,6 +268,12 @@ bool Auctionator::CreateAuction(AuctionatorItem newItem, CharacterDatabaseTransa
     GetAuctionHouse(houseId)->AddAuction(auctionEntry);
 
     auctionEntry->SaveToDB(trans);
+
+    // Record that this auction is ours, in the same transaction as the auctionhouse row: the
+    // sale log identifies module listings by id (a sale can happen long after a restart, so an
+    // in-memory set would not survive), and `deposit = 0` cannot be used for that - the core
+    // gives player listings a deposit of 0 as well when Rate.Auction.Deposit is 0.
+    AuctionatorSales().RememberCreated(auctionEntry, trans);
 
     // Only close a transaction we opened ourselves; a batched caller commits the whole run.
     if (ownTransaction) {
