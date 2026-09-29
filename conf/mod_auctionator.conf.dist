@@ -237,6 +237,19 @@ Auctionator.Seller.BidOnly = 0
 #     team" rather than "invalid item", and the filter can drop ~30% of the
 #     otherwise eligible items, so it is off unless the data says otherwise.
 #
+# Auctionator.Seller.MaxItemLevel
+#     Highest item level the automatic seller may list; 0 = no limit. Default: 0
+#
+#     A recipe (class 9) is judged by what it MAKES, not by its own item_template.ItemLevel,
+#     which is a placeholder on recipes: the module follows the recipe's taught spell
+#     (item_template.spells[1..5] with spelltrigger = 6) into Spell.dbc and compares the level
+#     of the item that spell creates (SPELL_EFFECT_CREATE_ITEM). A recipe whose crafted item
+#     cannot be resolved - enchanting formulas, inert tomes and books - is never listed.
+#
+#     Automatic seller only; GM listings (".auctionator add", "addlist",
+#     mod_auctionator_gm_list) are unaffected. Re-read once a minute with the candidate pool,
+#     so ".auctionator maxitemlevel <value|off>" applies without a restart.
+#
 # Auctionator.Seller.MinPriceModifier
 #     Price floor, applied to item_template.SellPrice (the vendor sell price).
 #     1.0 = never list below what a vendor would pay. Default: 1.0
@@ -321,6 +334,7 @@ Auctionator.MarketData.ScanExcludeSelf = 1
 Auctionator.MarketData.RetentionDays = 30
 Auctionator.Seller.PreferMarketItems = 1
 Auctionator.Seller.ExcludeUnverifiedItems = 0
+Auctionator.Seller.MaxItemLevel = 0
 Auctionator.Seller.MinPriceModifier = 1.0
 Auctionator.Seller.MaxPriceModifier = 2.0
 

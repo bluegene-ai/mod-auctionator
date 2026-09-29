@@ -5,6 +5,9 @@
 // MAX_MONEY_AMOUNT is a macro in Player.h and is declared nowhere else, so this include is
 // needed even though this file never touches a Player object.
 #include "Player.h"
+// sObjectMgr / sSpellMgr resolve the crafted item of a recipe for the item level gate below.
+#include "ObjectMgr.h"
+#include "SpellMgr.h"
 #include "DatabaseEnv.h"
 #include "QueryResult.h"
 #include "Random.h"
@@ -86,6 +89,44 @@ namespace
 
         return static_cast<uint32>(std::min<long long>(value, MAX_MONEY_AMOUNT));
     }
+
+    // Level of the item a recipe teaches to craft; 0 when no such item can be resolved.
+    // The craft spell is the one whose spelltrigger is ITEM_SPELLTRIGGER_LEARN_SPELL_ID; it
+    // creates the product through SPELL_EFFECT_CREATE_ITEM, and the slot is not fixed, so all
+    // three are checked. Enchanting formulas create no item and answer 0.
+    uint32 CraftedItemLevel(ItemTemplate const* recipe)
+    {
+        for (uint8 slot = 0; slot < MAX_ITEM_PROTO_SPELLS; ++slot)
+        {
+            if (recipe->Spells[slot].SpellTrigger != ITEM_SPELLTRIGGER_LEARN_SPELL_ID
+                || recipe->Spells[slot].SpellId <= 0)
+            {
+                continue;
+            }
+
+            SpellInfo const* spell = sSpellMgr->GetSpellInfo(static_cast<uint32>(recipe->Spells[slot].SpellId));
+            if (!spell)
+            {
+                continue;
+            }
+
+            for (uint8 effect = 0; effect < MAX_SPELL_EFFECTS; ++effect)
+            {
+                SpellEffectInfo const& info = spell->GetEffect(static_cast<SpellEffIndex>(effect));
+                if (info.Effect != SPELL_EFFECT_CREATE_ITEM || info.ItemType == 0)
+                {
+                    continue;
+                }
+
+                if (ItemTemplate const* product = sObjectMgr->GetItemTemplate(info.ItemType))
+                {
+                    return product->ItemLevel;
+                }
+            }
+        }
+
+        return 0;
+    }
 }
 
 AuctionatorSeller::AuctionatorSeller(Auctionator* natorParam)
@@ -146,6 +187,9 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
         ? " AND it.VerifiedBuild != 1"
         : "";
 
+    // 0 = no item level limit; read once per pool build (the pool itself is cached).
+    uint32 const maxItemLevel = nator->config->sellerConfig.maxItemLevel;
+
     std::string cacheQuery = R"(
         SELECT
             it.entry, it.name, it.BuyPrice, it.SellPrice, it.stackable, it.quality
@@ -154,6 +198,7 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
             , COALESCE(GREATEST(0, TIMESTAMPDIFF(SECOND, mp.scan_datetime, NOW())), 0) as scan_age_seconds
             , aicconf.max_count
             , COALESCE(aicconf.stack_count, 0) as stack_count
+            , it.ItemLevel, it.class
         FROM
             {}.mod_auctionator_itemclass_config aicconf
             INNER JOIN {}.item_template it ON
@@ -225,6 +270,11 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
             return;
         }
 
+        // Counters for the item level gate, reported below (and in the "everything was
+        // dropped" message, where they are the whole explanation).
+        uint32 recipesWithoutProduct = 0;
+        uint32 skippedByItemLevel = 0;
+
         do
         {
             Field* fields = result->Fetch();
@@ -240,17 +290,57 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
             item.marketAgeSeconds = fields[8].Get<uint32>();
             item.maxCount = fields[9].Get<uint32>();
             item.stackCount = fields[10].Get<uint32>();
+
+            // Item level gate: a recipe counts as the item it makes, never as its own
+            // ItemLevel (a placeholder on recipes). A recipe whose crafted item cannot be
+            // resolved is never listed, at any setting of the limit; GM listings are exempt.
+            item.itemLevel = fields[11].Get<uint32>();
+
+            if (fields[12].Get<uint32>() == ITEM_CLASS_RECIPE)
+            {
+                ItemTemplate const* recipe = sObjectMgr->GetItemTemplate(item.entry);
+                item.itemLevel = recipe ? CraftedItemLevel(recipe) : 0;
+
+                if (item.itemLevel == 0)
+                {
+                    ++recipesWithoutProduct;
+                    continue;
+                }
+            }
+
+            if (maxItemLevel > 0 && item.itemLevel > maxItemLevel)
+            {
+                ++skippedByItemLevel;
+                continue;
+            }
+
             PoolCache.push_back(item);
         } while (result->NextRow());
 
         if (PoolCache.empty())
         {
+            // The gate removed every fetched row, so the query itself is fine: reporting the
+            // counters keeps this apart from the "check the world DB grants" message above.
+            if (recipesWithoutProduct > 0 || skippedByItemLevel > 0)
+            {
+                logWarn("item level gate dropped every one of the " + std::to_string(recipesWithoutProduct + skippedByItemLevel)
+                    + " usable row(s) for house " + std::to_string(houseId) + ": "
+                    + std::to_string(recipesWithoutProduct) + " recipe(s) whose crafted item cannot be resolved "
+                      "(never listed by the automatic seller) and "
+                    + std::to_string(skippedByItemLevel) + " item(s) above Auctionator.Seller.MaxItemLevel = "
+                    + std::to_string(maxItemLevel) + ". Raise that limit, or add the class/subclass you want "
+                      "listed to mod_auctionator_itemclass_config.");
+                return;
+            }
+
             logWarn("seller item query returned no usable rows for house " + std::to_string(houseId) + ".");
             return;
         }
 
         PoolCacheMs = nowMs;
-        logDebug("seller pool refreshed: " + std::to_string(PoolCache.size()) + " item(s)");
+        logDebug("seller pool refreshed: " + std::to_string(PoolCache.size()) + " item(s)"
+            + " (item level gate: " + std::to_string(recipesWithoutProduct) + " recipe(s) without a crafted item, "
+            + std::to_string(skippedByItemLevel) + " above " + std::to_string(maxItemLevel) + ")");
     }
 
     std::vector<CachedItem> const& cachedItems = PoolCache;
@@ -478,6 +568,7 @@ void AuctionatorSeller::LetsGetToIt(uint32 maxCount, uint32 houseId)
         newItem.stackSize = stackSize;
 
         logDebug("Adding item: " + itemName
+            + " ilvl " + std::to_string(item.itemLevel)
             + " stack " + std::to_string(newItem.stackSize)
             + " bid " + std::to_string(newItem.bid)
             + " buyout " + std::to_string(newItem.buyout)

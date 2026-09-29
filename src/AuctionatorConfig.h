@@ -67,6 +67,14 @@ struct AuctionatorSellerConfig
     // Turning it on drops roughly 30% of the otherwise eligible items.
     uint32 excludeUnverifiedItems = 0;
 
+    // Highest effective item level the automatic seller may list; 0 = no limit.
+    // A recipe (class 9) is judged by the level of the item its taught spell creates, not by
+    // its own ItemLevel, which is a placeholder on recipes. A recipe whose crafted item cannot
+    // be resolved (enchanting formulas, inert tomes) is never listed, whatever this value is.
+    // Automatic seller only: GM listings are unaffected.
+    // Keep in sync with Auctionator::InitializeConfig() and conf/mod_auctionator.conf.dist.
+    uint32 maxItemLevel = 0;
+
     // Price floor, applied to item_template.SellPrice (1.0 = never list below
     // what a vendor would pay). The ceiling is applied to the market average and only used
     // when market data is available; it is applied *before* the floor, so the floor always

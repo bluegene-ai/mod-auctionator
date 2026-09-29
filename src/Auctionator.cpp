@@ -527,6 +527,7 @@ void Auctionator::InitializeConfig(ConfigMgr* configMgr)
     config->marketDataScanExcludeSelf = configMgr->GetOption<uint32>("Auctionator.MarketData.ScanExcludeSelf", 1);
     config->sellerConfig.preferMarketItems = configMgr->GetOption<uint32>("Auctionator.Seller.PreferMarketItems", 1);
     config->sellerConfig.excludeUnverifiedItems = configMgr->GetOption<uint32>("Auctionator.Seller.ExcludeUnverifiedItems", 0);
+    config->sellerConfig.maxItemLevel = configMgr->GetOption<uint32>("Auctionator.Seller.MaxItemLevel", 0);
     config->sellerConfig.minPriceModifier = std::max(
         0.0f,
         configMgr->GetOption<float>("Auctionator.Seller.MinPriceModifier", 1.0f)

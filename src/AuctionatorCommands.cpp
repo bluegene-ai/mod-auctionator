@@ -307,6 +307,12 @@ class AuctionatorCommands : public CommandScript
                 return CommandSetBuyout(commandParams, handler, auctionator);
             }
 
+            // Item level limit of the automatic seller; the panel persists it in the option file.
+            if (command == "maxitemlevel")
+            {
+                return CommandSetMaxItemLevel(commandParams, handler, auctionator);
+            }
+
             if (command == "bidspercycle")
             {
                 return CommandBidsPerCycle(commandParams, handler, auctionator);
@@ -1291,6 +1297,12 @@ buyout <0|1>
      effect on the next seller run. Only the running configuration changes; the
      panel's buyout switch also writes Auctionator.Seller.BidOnly to the option
      file so the choice survives a restart.
+maxitemlevel <value|off>
+     Highest item level the AUTOMATIC seller may list; off or 0 = no limit.
+     A recipe counts as the item it makes, not as its own ItemLevel, and a recipe
+     whose crafted item cannot be resolved is never listed. GM listings (add /
+     addlist / mod_auctionator_gm_list) are unaffected. Takes effect on the next
+     seller run; the panel's item filter tab writes the option file.
 disable <hordeseller|allianceseller|neutralseller|hordebidder|alliancebidder|neutralbidder|all>
 enable <same targets as disable>
 start | on
@@ -1405,6 +1417,9 @@ help
             statusString += "    Market data max age (days, seller+bidder, 0 = never): " + std::to_string(auctionator->config->marketDataMaxAgeDays) + "\n";
             statusString += "    Prefer market items: " + std::to_string(auctionator->config->sellerConfig.preferMarketItems) + "\n";
             statusString += "    Exclude VerifiedBuild = 1 items: " + std::to_string(auctionator->config->sellerConfig.excludeUnverifiedItems) + "\n";
+            // Automatic seller only; a recipe counts as the item it makes.
+            statusString += "    Max item level, automatic seller only (0 = no limit): "
+                + std::to_string(auctionator->config->sellerConfig.maxItemLevel) + "\n";
             statusString += "    Min price modifier (x SellPrice): " + std::to_string(auctionator->config->sellerConfig.minPriceModifier) + "\n";
             statusString += "    Max price modifier (x market avg): " + std::to_string(auctionator->config->sellerConfig.maxPriceModifier) + "\n";
 
@@ -1873,6 +1888,47 @@ help
                     "(Auctionator.Seller.BidOnly = 1), so they can only be won by bidding. "
                     "Takes effect on the next seller run.");
                 auctionator->logInfo("buyout: disabled (Auctionator.Seller.BidOnly = 1)");
+            }
+
+            return true;
+        }
+
+        // .auctionator maxitemlevel <value|off>
+        //
+        // Limit for the automatic seller; "off" (or 0) removes it. Only the running
+        // configuration changes - the panel persists the same value in the option file.
+        static bool CommandSetMaxItemLevel(std::vector<std::string> const& params, ChatHandler* handler, Auctionator* auctionator)
+        {
+            if (params.size() != 1)
+            {
+                handler->SendSysMessage("[Auctionator] maxitemlevel: usage <value|off> (off or 0 = no limit)");
+                return true;
+            }
+
+            uint32 maxItemLevel = 0;
+            std::string const value = params[0];
+            if (value != "off" && !TryParseUInt32(value, maxItemLevel))
+            {
+                handler->SendSysMessage("[Auctionator] maxitemlevel: expected a number or 'off' (0 = no limit).");
+                return true;
+            }
+
+            WarnIfModuleDisabled(handler, auctionator);
+
+            auctionator->config->sellerConfig.maxItemLevel = maxItemLevel;
+
+            if (maxItemLevel == 0)
+            {
+                handler->SendSysMessage("[Auctionator] maxitemlevel: no limit (Auctionator.Seller.MaxItemLevel = 0). "
+                    "Recipes whose crafted item cannot be resolved stay unlisted. Takes effect on the next seller run.");
+                auctionator->logInfo("maxitemlevel: no limit (Auctionator.Seller.MaxItemLevel = 0)");
+            }
+            else
+            {
+                handler->SendSysMessage("[Auctionator] maxitemlevel: " + std::to_string(maxItemLevel)
+                    + " (Auctionator.Seller.MaxItemLevel). The automatic seller stops listing items above it, and judges "
+                      "a recipe by the level of the item it makes. Takes effect on the next seller run.");
+                auctionator->logInfo("maxitemlevel: " + std::to_string(maxItemLevel) + " (Auctionator.Seller.MaxItemLevel)");
             }
 
             return true;

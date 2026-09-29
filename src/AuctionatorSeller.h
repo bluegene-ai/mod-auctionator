@@ -20,6 +20,9 @@ struct CachedItem {
     uint32 marketAgeSeconds = 0;
     uint32 maxCount = 0;
     uint32 stackCount = 0;        // mod_auctionator_itemclass_config.stack_count (0 = use the item's max stack)
+    // Effective item level used by the Auctionator.Seller.MaxItemLevel gate: the item's own
+    // ItemLevel, or - for a recipe - the level of the item its craft spell creates.
+    uint32 itemLevel = 0;
 };
 
 class AuctionatorSeller : public AuctionatorBase

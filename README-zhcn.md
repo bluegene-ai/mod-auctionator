@@ -182,6 +182,19 @@ ItemID 可以在数据库表 `item_template` 中查找。两种写法**不能混
 .auctionator buyout 1    # 恢复买断模式
 ```
 
+### auctionator maxitemlevel <value|off>
+
+**自动卖家**的物品等级上限；`off`（或 `0`）表示不限。
+
+**配方**（物品类别 9）按它**制作出来的成品**等级判定，不按配方自身的 `item_template.ItemLevel`（配方上是占位值）。模块顺着配方教出的法术（`spelltrigger = 6`）查 Spell.dbc，取该法术制作出的物品（`SPELL_EFFECT_CREATE_ITEM`）并比较其等级：`设计图：萨隆邪铁断剑护腕`（47623，自身 85）在上限低于 245 时被挡下，那正是它教出的成品（47570）的等级。
+
+制作成品**解析不出来**的配方（附魔公式、图鉴/书籍）无论上限多少都不上架；GM 上架不受影响。该值与候选池一起重读，下一轮卖家运行即生效、不必重启。
+
+```
+.auctionator maxitemlevel 200    # 200 级以上的物品不再自动上架
+.auctionator maxitemlevel off    # 恢复不限
+```
+
 ### auctionator disable <target>
 
 对特定阵营禁用卖家或竞标者。`<target>` 是以下之一：`hordeseller`、`allianceseller`、`neutralseller`、`hordebidder`、`alliancebidder`、`neutralbidder` 或 `all`。
@@ -440,6 +453,8 @@ Auctionator.MarketData.ScanExcludeSelf = 1
 `mod_auctionator_itemclass_config` 是**白名单**而不是黑名单：卖家的候选查询对它做 `INNER JOIN`，所以没有行的「类别/子类别」永远不会被上架。这也是为什么“启用一类”要靠**建行**（面板的「应用到整类」会按 `mod_auctionator_item_class` 补齐），而“停用一类”是把 `max_count` 设为 0。
 
 `item_template.VerifiedBuild = 1` 的行默认**不会**被过滤掉：在大多数 world 数据库中，该标志表示“未经内容团队验证”，跳过这些行会移除很大一部分可用目录（在标准 WotLK world 数据库中约 30%）。如果你的数据对此有不同含义，请设置 `Auctionator.Seller.ExcludeUnverifiedItems = 1`。
+
+`Auctionator.Seller.MaxItemLevel` 限制自动卖家可上架的物品等级（`0` = 不限）；配方的判定方式见上文 `.auctionator maxitemlevel`。
 
 三张表在每个卖家周期都会重新读取，因此编辑无需重启即可生效。
 

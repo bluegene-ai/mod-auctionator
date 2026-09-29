@@ -289,6 +289,27 @@ writes `Auctionator.Seller.BidOnly` into the option file so the choice survives 
 .auctionator buyout 1    # buyout mode back on
 ```
 
+### auctionator maxitemlevel <value|off>
+
+The item level limit of the **automatic seller**, and the command behind the management
+panel's item filter control. `off` (or `0`) removes the limit.
+
+A **recipe** (item class 9) is judged by the level of the item it *makes*, never by its own
+`item_template.ItemLevel`, which is a placeholder on recipes. The module follows the recipe's
+taught spell (`item_template.spells` with `spelltrigger = 6`) into Spell.dbc and compares the
+level of the item that spell creates (`SPELL_EFFECT_CREATE_ITEM`): `Plans: Saronite
+Swordbreakers` (47623, ItemLevel 85) is refused once the limit is below 245, the level of the
+bracers it teaches (47570).
+
+A recipe whose crafted item cannot be resolved - enchanting formulas, inert tomes and books -
+is never listed, whatever the limit is. GM listings are unaffected. The value is read with the
+candidate pool, so it applies on the next seller run without a restart.
+
+```
+.auctionator maxitemlevel 200    # nothing above item level 200 is auto-listed
+.auctionator maxitemlevel off    # no limit again
+```
+
 ### auctionator disable <target>
 
 Disable the seller or bidder for a particular faction. `<target>` is one of
@@ -685,6 +706,9 @@ world databases that flag means "not verified by the content team", and skipping
 rows removes a large part of the eligible catalogue (~30% on a stock WotLK world
 database). Set `Auctionator.Seller.ExcludeUnverifiedItems = 1` if your data means
 something else by it.
+
+`Auctionator.Seller.MaxItemLevel` caps the level the automatic seller may list (`0` = no
+limit); see `.auctionator maxitemlevel` above for how a recipe is judged.
 
 All three tables are read on every seller cycle, so edits apply on the next run without a
 restart.
